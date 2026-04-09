@@ -1,0 +1,28 @@
+{
+  "images": [
+    {
+      "board_target": "app_sensor",
+      "imu_model": "icm45686",
+      "profile": "imu_calibration_rtt",
+      "hex": "app_sensor/icm45686_calibration.hex"
+    },
+    {
+      "board_target": "app_sensor",
+      "imu_model": "bno086",
+      "profile": "imu_calibration_rtt",
+      "hex": "app_sensor/bno086_calibration.hex"
+    },
+    {
+      "board_target": "app_controller",
+      "imu_model": "icm45686",
+      "profile": "imu_calibration_rtt",
+      "hex": "app_controller/icm45686_calibration.hex"
+    },
+    {
+      "board_target": "app_controller",
+      "imu_model": "bno086",
+      "profile": "imu_calibration_rtt",
+      "hex": "app_controller/bno086_calibration.hex"
+    }
+  ]
+}
