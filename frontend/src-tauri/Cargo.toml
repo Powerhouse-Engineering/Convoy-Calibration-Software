@@ -13,6 +13,7 @@ calibration-backend = { path = "../../backend" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
 
 [features]
 default = ["custom-protocol"]

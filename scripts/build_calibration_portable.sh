@@ -61,6 +61,35 @@ cat > "${PORTABLE_DIR}/run_calibration_gui.sh" <<'RUNEOF'
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+restore_snap_orig_var() {
+  local target_var="$1"
+  local snap_orig_var="${target_var}_VSCODE_SNAP_ORIG"
+
+  if [ "${!snap_orig_var+x}" = "x" ]; then
+    if [ -n "${!snap_orig_var}" ]; then
+      printf -v "${target_var}" '%s' "${!snap_orig_var}"
+      export "${target_var}"
+    else
+      unset "${target_var}"
+    fi
+  fi
+}
+
+sanitize_snap_runtime_env() {
+  restore_snap_orig_var "XDG_CONFIG_DIRS"
+  restore_snap_orig_var "GDK_BACKEND"
+  restore_snap_orig_var "GIO_MODULE_DIR"
+  restore_snap_orig_var "GSETTINGS_SCHEMA_DIR"
+  restore_snap_orig_var "GTK_IM_MODULE_FILE"
+  restore_snap_orig_var "GTK_PATH"
+  restore_snap_orig_var "LOCPATH"
+  restore_snap_orig_var "XDG_DATA_HOME"
+  restore_snap_orig_var "XDG_DATA_DIRS"
+  restore_snap_orig_var "GTK_EXE_PREFIX"
+}
+
+sanitize_snap_runtime_env
 export CAL_SW_FIRMWARE_DIR="${CAL_SW_FIRMWARE_DIR:-${SCRIPT_DIR}/firmware}"
 exec "${SCRIPT_DIR}/convoy-calibration-gui" "$@"
 RUNEOF

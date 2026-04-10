@@ -65,10 +65,18 @@ if [ "${needs_rebuild}" -eq 0 ]; then
   BIN_PATH="${PORTABLE_DIR}/${APP_BINARY}"
   if [ "${CAL_ROOT}/frontend/src-tauri/tauri.conf.json" -nt "${BIN_PATH}" ] || \
      [ "${CAL_ROOT}/frontend/src-tauri/Cargo.toml" -nt "${BIN_PATH}" ] || \
-     [ "${CAL_ROOT}/frontend/src-tauri/icons/icon.png" -nt "${BIN_PATH}" ] || \
-     [ "${CAL_ROOT}/frontend/src/App.tsx" -nt "${BIN_PATH}" ] || \
-     [ "${CAL_ROOT}/backend/src/backend.rs" -nt "${BIN_PATH}" ]; then
+     [ "${CAL_ROOT}/frontend/src-tauri/icons/icon.png" -nt "${BIN_PATH}" ]; then
     needs_rebuild=1
+  fi
+
+  if [ "${needs_rebuild}" -eq 0 ]; then
+    if find \
+      "${CAL_ROOT}/frontend/src" \
+      "${CAL_ROOT}/frontend/src-tauri/src" \
+      "${CAL_ROOT}/backend/src" \
+      -type f -newer "${BIN_PATH}" -print -quit | grep -q .; then
+      needs_rebuild=1
+    fi
   fi
 fi
 

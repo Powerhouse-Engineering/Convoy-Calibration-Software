@@ -176,7 +176,6 @@ pub struct ToolStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolchainStatus {
     pub nrfjprog: ToolStatus,
-    pub west: ToolStatus,
     pub jlink_gdb_server: ToolStatus,
 }
 
@@ -206,6 +205,11 @@ pub struct IcmCaptureCalibrationRequest {
     pub ack_timeout_ms: u64,
     pub capture_seconds: f32,
     pub gyro_bias_seconds: f32,
+    pub compute_gyro: bool,
+    pub compute_accel: bool,
+    pub min_total_samples: usize,
+    pub min_gyro_samples: usize,
+    pub min_accel_points: usize,
     pub odr_hz: u32,
     pub stream_hz: u32,
     pub accel_range_g: u32,
@@ -213,6 +217,8 @@ pub struct IcmCaptureCalibrationRequest {
     pub low_noise: bool,
     pub fifo: bool,
     pub fifo_hires: bool,
+    #[serde(default)]
+    pub keep_stream_running: bool,
 }
 
 impl Default for IcmCaptureCalibrationRequest {
@@ -221,12 +227,17 @@ impl Default for IcmCaptureCalibrationRequest {
             serial_number: None,
             device_name: "nRF52840_xxAA".to_string(),
             speed_khz: 4000,
-            gdb_port: 2331,
-            rtt_telnet_port: 19021,
+            gdb_port: 2335,
+            rtt_telnet_port: 19025,
             connect_timeout_ms: 10_000,
             ack_timeout_ms: 2_000,
             capture_seconds: 30.0,
             gyro_bias_seconds: 5.0,
+            compute_gyro: true,
+            compute_accel: true,
+            min_total_samples: 80,
+            min_gyro_samples: 20,
+            min_accel_points: 80,
             odr_hz: 200,
             stream_hz: 200,
             accel_range_g: 16,
@@ -234,6 +245,7 @@ impl Default for IcmCaptureCalibrationRequest {
             low_noise: true,
             fifo: true,
             fifo_hires: false,
+            keep_stream_running: false,
         }
     }
 }
@@ -252,6 +264,8 @@ pub struct IcmCalibrationEstimate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IcmCaptureCalibrationResult {
     pub estimate: IcmCalibrationEstimate,
+    pub computed_gyro: bool,
+    pub computed_accel: bool,
     pub responses: Vec<String>,
 }
 
@@ -270,6 +284,8 @@ pub struct IcmWriteCalibrationRequest {
     pub low_noise: bool,
     pub fifo: bool,
     pub fifo_hires: bool,
+    pub write_gyro_bias: bool,
+    pub write_accel: bool,
     pub estimate: IcmCalibrationEstimate,
 }
 
@@ -279,8 +295,8 @@ impl Default for IcmWriteCalibrationRequest {
             serial_number: None,
             device_name: "nRF52840_xxAA".to_string(),
             speed_khz: 4000,
-            gdb_port: 2331,
-            rtt_telnet_port: 19021,
+            gdb_port: 2335,
+            rtt_telnet_port: 19025,
             connect_timeout_ms: 10_000,
             ack_timeout_ms: 2_000,
             odr_hz: 200,
@@ -289,6 +305,8 @@ impl Default for IcmWriteCalibrationRequest {
             low_noise: true,
             fifo: true,
             fifo_hires: false,
+            write_gyro_bias: true,
+            write_accel: true,
             estimate: IcmCalibrationEstimate {
                 sample_count: 0,
                 gyro_sample_count: 0,
@@ -327,8 +345,8 @@ impl Default for RttCommandRequest {
             serial_number: None,
             device_name: "nRF52840_xxAA".to_string(),
             speed_khz: 4000,
-            gdb_port: 2331,
-            rtt_telnet_port: 19021,
+            gdb_port: 2335,
+            rtt_telnet_port: 19025,
             connect_timeout_ms: 10_000,
             ack_timeout_ms: 2_000,
             commands: Vec::new(),

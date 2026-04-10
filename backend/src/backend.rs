@@ -1,4 +1,7 @@
-use crate::calibration::{estimate_icm_calibration, parse_icm_csv_sample};
+use crate::calibration::{
+    ensure_min_total_samples, estimate_accel_ellipsoid_with_min_points,
+    estimate_gyro_bias_with_min_samples, parse_icm_csv_sample,
+};
 use crate::config::BackendConfig;
 use crate::manifest::FirmwareManifest;
 use crate::process::{run_command, tail_lines};
@@ -31,8 +34,7 @@ impl CalibrationBackend {
     pub fn check_tools(&self) -> ToolchainStatus {
         ToolchainStatus {
             nrfjprog: self.detect_tool(&self.config.nrfjprog_executable, &["--version"]),
-            west: self.detect_tool(&self.config.west_executable, &["--version"]),
-            jlink_gdb_server: self.detect_tool(&self.config.jlink_gdb_server_executable, &["-?"]),
+            jlink_gdb_server: self.detect_tool(&self.config.jlink_gdb_server_executable, &["-version"]),
         }
     }
 
@@ -177,6 +179,13 @@ impl CalibrationBackend {
         &self,
         request: IcmCaptureCalibrationRequest,
     ) -> Result<IcmCaptureCalibrationResult> {
+        if !request.compute_gyro && !request.compute_accel {
+            return Err(BackendError::InvalidInput(
+                "at least one capture mode must be enabled (compute_gyro or compute_accel)"
+                    .to_string(),
+            ));
+        }
+
         let mut session = self.open_rtt_session(
             request.serial_number.clone(),
             request.device_name.clone(),
@@ -229,10 +238,44 @@ impl CalibrationBackend {
             responses.extend(stop_result.lines);
         }
 
-        let estimate = estimate_icm_calibration(&samples, request.gyro_bias_seconds.max(0.5))?;
+        ensure_min_total_samples(&samples, request.min_total_samples.max(1))?;
+
+        let mut estimate = crate::types::IcmCalibrationEstimate {
+            sample_count: samples.len(),
+            gyro_sample_count: 0,
+            gyro_bias_dps: [0.0, 0.0, 0.0],
+            accel_offset_mps2: [0.0, 0.0, 0.0],
+            accel_xform: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            residual_rms_mps2: 0.0,
+            residual_max_mps2: 0.0,
+        };
+
+        if request.compute_gyro {
+            let (gyro_bias, gyro_sample_count) = estimate_gyro_bias_with_min_samples(
+                &samples,
+                request.gyro_bias_seconds.max(0.5),
+                request.min_gyro_samples.max(1),
+            )?;
+            estimate.gyro_bias_dps = gyro_bias;
+            estimate.gyro_sample_count = gyro_sample_count;
+        }
+
+        if request.compute_accel {
+            let (accel_offset, accel_xform, residual_rms, residual_max, _point_count) =
+                estimate_accel_ellipsoid_with_min_points(
+                    &samples,
+                    request.min_accel_points.max(1),
+                )?;
+            estimate.accel_offset_mps2 = accel_offset;
+            estimate.accel_xform = accel_xform;
+            estimate.residual_rms_mps2 = residual_rms;
+            estimate.residual_max_mps2 = residual_max;
+        }
 
         Ok(IcmCaptureCalibrationResult {
             estimate,
+            computed_gyro: request.compute_gyro,
+            computed_accel: request.compute_accel,
             responses,
         })
     }
@@ -244,28 +287,82 @@ impl CalibrationBackend {
             ));
         }
 
-        let mut session = self.open_rtt_session(
-            request.serial_number,
-            request.device_name,
-            request.speed_khz,
-            request.gdb_port,
-            request.rtt_telnet_port,
-            request.connect_timeout_ms,
-        )?;
+        let mut last_retryable_error: Option<BackendError> = None;
 
-        let ack_timeout = Duration::from_millis(request.ack_timeout_ms.max(500));
-        let mut results = Vec::with_capacity(request.commands.len());
-        for command in &request.commands {
-            results.push(session.send_command_and_wait_ack(command, ack_timeout)?);
+        for attempt in 0..2 {
+            let mut session = self.open_rtt_session(
+                request.serial_number.clone(),
+                request.device_name.clone(),
+                request.speed_khz,
+                request.gdb_port,
+                request.rtt_telnet_port,
+                request.connect_timeout_ms,
+            )?;
+
+            let ack_timeout = Duration::from_millis(request.ack_timeout_ms.max(500));
+            let mut results = Vec::with_capacity(request.commands.len());
+            let mut retry_needed = false;
+
+            for command in &request.commands {
+                match session.send_command_and_wait_ack(command, ack_timeout) {
+                    Ok(result) => results.push(result),
+                    Err(err) => {
+                        if attempt == 0 && is_retryable_rtt_io_error(&err) {
+                            last_retryable_error = Some(err);
+                            retry_needed = true;
+                            break;
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+
+            if !retry_needed {
+                return Ok(results);
+            }
+
+            std::thread::sleep(Duration::from_millis(200));
         }
 
-        Ok(results)
+        if let Some(err) = last_retryable_error {
+            return Err(err);
+        }
+
+        Err(BackendError::InvalidInput(
+            "failed to run RTT commands after retry".to_string(),
+        ))
+    }
+
+    pub fn open_rtt_text_session(
+        &self,
+        serial_number: Option<String>,
+        device_name: String,
+        speed_khz: u32,
+        gdb_port: u16,
+        rtt_telnet_port: u16,
+        connect_timeout_ms: u64,
+    ) -> Result<RttSession> {
+        self.open_rtt_session(
+            serial_number,
+            device_name,
+            speed_khz,
+            gdb_port,
+            rtt_telnet_port,
+            connect_timeout_ms,
+        )
     }
 
     pub fn write_icm_calibration(
         &self,
         request: IcmWriteCalibrationRequest,
     ) -> Result<IcmWriteCalibrationResult> {
+        if !request.write_gyro_bias && !request.write_accel {
+            return Err(BackendError::InvalidInput(
+                "at least one write mode must be enabled (write_gyro_bias or write_accel)"
+                    .to_string(),
+            ));
+        }
+
         let mut session = self.open_rtt_session(
             request.serial_number.clone(),
             request.device_name.clone(),
@@ -307,35 +404,39 @@ impl CalibrationBackend {
         )?);
         commands.push(session.send_command_and_wait_ack("APPLY", ack_timeout)?);
 
-        let gyro = request.estimate.gyro_bias_dps;
-        commands.push(session.send_command_and_wait_ack(
-            &format!(
-                "CAL_SET_GYRO_BIAS {:.8} {:.8} {:.8}",
-                gyro[0], gyro[1], gyro[2]
-            ),
-            ack_timeout,
-        )?);
+        if request.write_gyro_bias {
+            let gyro = request.estimate.gyro_bias_dps;
+            commands.push(session.send_command_and_wait_ack(
+                &format!(
+                    "CAL_SET_GYRO_BIAS {:.8} {:.8} {:.8}",
+                    gyro[0], gyro[1], gyro[2]
+                ),
+                ack_timeout,
+            )?);
+        }
 
-        let offset = request.estimate.accel_offset_mps2;
-        let x = request.estimate.accel_xform;
-        commands.push(session.send_command_and_wait_ack(
-            &format!(
-                "CAL_SET_ACCEL {:.8} {:.8} {:.8} {:.8} {:.8} {:.8} {:.8} {:.8} {:.8} {:.8} {:.8} {:.8}",
-                offset[0],
-                offset[1],
-                offset[2],
-                x[0][0],
-                x[0][1],
-                x[0][2],
-                x[1][0],
-                x[1][1],
-                x[1][2],
-                x[2][0],
-                x[2][1],
-                x[2][2]
-            ),
-            ack_timeout,
-        )?);
+        if request.write_accel {
+            let offset = request.estimate.accel_offset_mps2;
+            let x = request.estimate.accel_xform;
+            commands.push(session.send_command_and_wait_ack(
+                &format!(
+                    "CAL_SET_ACCEL {:.8} {:.8} {:.8} {:.8} {:.8} {:.8} {:.8} {:.8} {:.8} {:.8} {:.8} {:.8}",
+                    offset[0],
+                    offset[1],
+                    offset[2],
+                    x[0][0],
+                    x[0][1],
+                    x[0][2],
+                    x[1][0],
+                    x[1][1],
+                    x[1][2],
+                    x[2][0],
+                    x[2][1],
+                    x[2][2]
+                ),
+                ack_timeout,
+            )?);
+        }
 
         commands.push(session.send_command_and_wait_ack("CAL_SAVE", ack_timeout)?);
         commands.push(session.send_command_and_wait_ack("CAL_STATUS", ack_timeout)?);
@@ -386,6 +487,7 @@ impl CalibrationBackend {
         rtt_telnet_port: u16,
         connect_timeout_ms: u64,
     ) -> Result<RttSession> {
+        let rtt_control_block_addr = self.detect_preferred_rtt_control_block(serial_number.as_deref());
         let config = RttServerConfig {
             serial_number,
             device_name,
@@ -393,6 +495,7 @@ impl CalibrationBackend {
             gdb_port,
             rtt_telnet_port,
             connect_timeout: Duration::from_millis(connect_timeout_ms.max(500)),
+            rtt_control_block_addr,
         };
 
         RttSession::start(&self.config.jlink_gdb_server_executable, &config)
@@ -427,6 +530,47 @@ impl CalibrationBackend {
 
     fn ensure_nrfjprog_available(&self) -> Result<()> {
         ensure_tool_available(&self.config.nrfjprog_executable, &["--version"])
+    }
+
+    fn detect_preferred_rtt_control_block(&self, serial_number: Option<&str>) -> Option<u32> {
+        match self.find_rtt_control_blocks(serial_number) {
+            Ok(addresses) => addresses.into_iter().max(),
+            Err(_) => None,
+        }
+    }
+
+    fn find_rtt_control_blocks(&self, serial_number: Option<&str>) -> Result<Vec<u32>> {
+        let mut addresses = self.scan_rtt_control_blocks(serial_number, "0x10000")?;
+        if addresses.is_empty() {
+            addresses = self.scan_rtt_control_blocks(serial_number, "0x40000")?;
+        }
+        addresses.sort_unstable();
+        addresses.dedup();
+        Ok(addresses)
+    }
+
+    fn scan_rtt_control_blocks(
+        &self,
+        serial_number: Option<&str>,
+        ram_len: &str,
+    ) -> Result<Vec<u32>> {
+        let mut args = Vec::<String>::new();
+        if let Some(snr) = serial_number {
+            let trimmed = snr.trim();
+            if !trimmed.is_empty() {
+                args.push("--snr".to_string());
+                args.push(trimmed.to_string());
+            }
+        }
+        args.push("--memrd".to_string());
+        args.push("0x20000000".to_string());
+        args.push("--n".to_string());
+        args.push(ram_len.to_string());
+        args.push("--w".to_string());
+        args.push("8".to_string());
+
+        let output = run_command(&self.config.nrfjprog_executable, &args, None)?;
+        Ok(parse_rtt_control_block_addresses(&output.stdout))
     }
 
     fn ensure_west_available(&self) -> Result<()> {
@@ -475,10 +619,48 @@ fn ensure_tool_available(executable: &str, version_args: &[&str]) -> Result<()> 
         .map_err(|_| BackendError::ToolUnavailable(executable.to_string()))
 }
 
+fn is_retryable_rtt_io_error(err: &BackendError) -> bool {
+    match err {
+        BackendError::Io(io_err) => matches!(
+            io_err.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
+}
+
 fn resolve_relative_to(base: &Path, candidate: &Path) -> PathBuf {
     if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
         base.join(candidate)
     }
+}
+
+fn parse_rtt_control_block_addresses(text: &str) -> Vec<u32> {
+    let mut addresses = Vec::<u32>::new();
+
+    for line in text.lines() {
+        if !line.contains("SEGGER RTT") {
+            continue;
+        }
+
+        let Some((addr_text, _)) = line.split_once(':') else {
+            continue;
+        };
+
+        let trimmed = addr_text.trim();
+        let Some(hex) = trimmed.strip_prefix("0x") else {
+            continue;
+        };
+
+        if let Ok(addr) = u32::from_str_radix(hex, 16) {
+            addresses.push(addr);
+        }
+    }
+
+    addresses
 }

@@ -52,6 +52,12 @@ body {
   gap: 12px;
 }
 
+.hero-controls {
+  display: grid;
+  gap: 8px;
+  justify-items: end;
+}
+
 .hero h1 {
   margin: 0 0 4px;
   font-size: clamp(1.15rem, 1rem + 0.8vw, 1.6rem);
@@ -71,6 +77,14 @@ body {
   color: #f3f8fb;
   background: linear-gradient(135deg, var(--accent), #0b5f66);
   white-space: nowrap;
+}
+
+.status-pill.connected {
+  background: linear-gradient(135deg, #1d9a68, #116545);
+}
+
+.status-pill.disconnected {
+  background: linear-gradient(135deg, #5a6975, #3a4853);
 }
 
 .tabs {
@@ -136,6 +150,17 @@ label {
   gap: 6px;
   font-size: 0.78rem;
   color: var(--muted);
+}
+
+.path-picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.path-picker button {
+  padding-inline: 12px;
 }
 
 input,
@@ -208,6 +233,49 @@ button:disabled {
   padding: 8px;
   max-height: 220px;
   overflow: auto;
+}
+
+.gyro-plots-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.gyro-plot-card {
+  border: 1px solid rgba(20, 35, 47, 0.14);
+  border-radius: 8px;
+  background: #f7fbfd;
+  padding: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.gyro-plot-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.gyro-plot-value {
+  font-family: "Space Mono", monospace;
+  color: var(--text);
+}
+
+.gyro-plot-empty {
+  color: var(--muted);
+  font-size: 0.74rem;
+  padding: 6px 2px;
+}
+
+.gyro-plot-canvas {
+  width: 100%;
+  height: 150px;
+  display: block;
+  border-radius: 6px;
+  background: #ffffff;
+  border: 1px solid rgba(20, 35, 47, 0.09);
 }
 
 .terminal-dock {
@@ -324,6 +392,10 @@ button:disabled {
   .hero {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .hero-controls {
+    justify-items: start;
   }
 
   .terminal-form {

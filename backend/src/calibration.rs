@@ -8,20 +8,11 @@ pub fn estimate_icm_calibration(
     samples: &[IcmCsvSample],
     gyro_bias_seconds: f32,
 ) -> Result<IcmCalibrationEstimate> {
-    if samples.len() < 80 {
-        return Err(BackendError::InvalidInput(
-            "not enough IMU samples for calibration (need at least 80)".to_string(),
-        ));
-    }
-
-    let gyro_bias = estimate_gyro_bias(samples, gyro_bias_seconds)?;
-    let (accel_offset, accel_xform, residual_rms, residual_max) =
-        estimate_accel_ellipsoid(samples)?;
-
-    let gyro_sample_count = samples
-        .iter()
-        .filter(|sample| sample.host_elapsed_s <= gyro_bias_seconds)
-        .count();
+    ensure_min_total_samples(samples, 80)?;
+    let (gyro_bias, gyro_sample_count) =
+        estimate_gyro_bias_with_min_samples(samples, gyro_bias_seconds, 20)?;
+    let (accel_offset, accel_xform, residual_rms, residual_max, _) =
+        estimate_accel_ellipsoid_with_min_points(samples, 80)?;
 
     Ok(IcmCalibrationEstimate {
         sample_count: samples.len(),
@@ -35,6 +26,14 @@ pub fn estimate_icm_calibration(
 }
 
 pub fn estimate_gyro_bias(samples: &[IcmCsvSample], gyro_bias_seconds: f32) -> Result<[f32; 3]> {
+    estimate_gyro_bias_with_min_samples(samples, gyro_bias_seconds, 20).map(|(bias, _)| bias)
+}
+
+pub fn estimate_gyro_bias_with_min_samples(
+    samples: &[IcmCsvSample],
+    gyro_bias_seconds: f32,
+    min_samples: usize,
+) -> Result<([f32; 3], usize)> {
     if gyro_bias_seconds <= 0.0 {
         return Err(BackendError::InvalidInput(
             "gyro_bias_seconds must be > 0".to_string(),
@@ -46,10 +45,11 @@ pub fn estimate_gyro_bias(samples: &[IcmCsvSample], gyro_bias_seconds: f32) -> R
         .filter(|sample| sample.host_elapsed_s <= gyro_bias_seconds)
         .collect::<Vec<&IcmCsvSample>>();
 
-    if window_samples.len() < 20 {
+    if window_samples.len() < min_samples {
         return Err(BackendError::InvalidInput(format!(
-            "not enough samples in gyro bias window ({} found, need at least 20)",
-            window_samples.len()
+            "not enough samples in gyro bias window ({} found, need at least {})",
+            window_samples.len(),
+            min_samples
         )));
     }
 
@@ -61,16 +61,28 @@ pub fn estimate_gyro_bias(samples: &[IcmCsvSample], gyro_bias_seconds: f32) -> R
     }
 
     let denom = window_samples.len() as f64;
-    Ok([
-        (bias[0] / denom) as f32,
-        (bias[1] / denom) as f32,
-        (bias[2] / denom) as f32,
-    ])
+    Ok((
+        [
+            (bias[0] / denom) as f32,
+            (bias[1] / denom) as f32,
+            (bias[2] / denom) as f32,
+        ],
+        window_samples.len(),
+    ))
 }
 
 pub fn estimate_accel_ellipsoid(
     samples: &[IcmCsvSample],
 ) -> Result<([f32; 3], [[f32; 3]; 3], f32, f32)> {
+    estimate_accel_ellipsoid_with_min_points(samples, 80).map(
+        |(offset, xform, rms, max, _point_count)| (offset, xform, rms, max),
+    )
+}
+
+pub fn estimate_accel_ellipsoid_with_min_points(
+    samples: &[IcmCsvSample],
+    min_points: usize,
+) -> Result<([f32; 3], [[f32; 3]; 3], f32, f32, usize)> {
     let accel_points = samples
         .iter()
         .filter_map(|sample| {
@@ -88,10 +100,11 @@ pub fn estimate_accel_ellipsoid(
         })
         .collect::<Vec<[f64; 3]>>();
 
-    if accel_points.len() < 80 {
+    if accel_points.len() < min_points {
         return Err(BackendError::InvalidInput(format!(
-            "not enough accel points for ellipsoid fit ({} found, need at least 80)",
-            accel_points.len()
+            "not enough accel points for ellipsoid fit ({} found, need at least {})",
+            accel_points.len(),
+            min_points
         )));
     }
 
@@ -115,8 +128,14 @@ pub fn estimate_accel_ellipsoid(
         design[(row, 8)] = 2.0 * z;
     }
 
-    let params = design.qr().solve(&ones).ok_or_else(|| {
-        BackendError::InvalidInput("ellipsoid fit failed to solve least squares".to_string())
+    let design_t = design.transpose();
+    let normal = &design_t * &design;
+    let rhs = &design_t * &ones;
+
+    let params = normal.lu().solve(&rhs).ok_or_else(|| {
+        BackendError::InvalidInput(
+            "ellipsoid fit failed to solve normal equation (matrix may be singular)".to_string(),
+        )
     })?;
 
     let mut shape = Matrix3::<f64>::zeros();
@@ -198,11 +217,29 @@ pub fn estimate_accel_ellipsoid(
         ],
         rms as f32,
         max_abs as f32,
+        accel_points.len(),
     ))
 }
 
+pub fn ensure_min_total_samples(samples: &[IcmCsvSample], min_total_samples: usize) -> Result<()> {
+    if samples.len() < min_total_samples {
+        return Err(BackendError::InvalidInput(format!(
+            "not enough IMU samples for calibration ({} found, need at least {})",
+            samples.len(),
+            min_total_samples
+        )));
+    }
+    Ok(())
+}
+
 pub fn parse_icm_csv_sample(line: &str, host_elapsed_s: f32) -> Option<IcmCsvSample> {
-    let fields = line.trim().split(',').collect::<Vec<&str>>();
+    let sanitized = sanitize_rtt_line(line);
+    let useful = match sanitized.find("RTT_IMU,") {
+        Some(idx) => &sanitized[idx..],
+        None => return None,
+    };
+
+    let fields = useful.trim().split(',').collect::<Vec<&str>>();
 
     if fields.len() < 16 {
         return None;
@@ -236,4 +273,36 @@ pub fn parse_icm_csv_sample(line: &str, host_elapsed_s: f32) -> Option<IcmCsvSam
         gyro_accuracy: parse_u8(fields[14])?,
         cal_state: parse_u8(fields[15])?,
     })
+}
+
+fn sanitize_rtt_line(input: &str) -> String {
+    let bytes = input.trim().as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1B {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'[' {
+                i += 1;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    i += 1;
+                    if (0x40..=0x7E).contains(&b) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            continue;
+        }
+
+        let b = bytes[i];
+        if b >= 0x20 || b == b'\t' {
+            out.push(b as char);
+        }
+        i += 1;
+    }
+
+    out
 }
