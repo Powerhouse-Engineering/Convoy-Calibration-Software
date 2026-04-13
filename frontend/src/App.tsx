@@ -8,6 +8,7 @@ import {
   listenGyroRealtimeSamples,
   listenGyroRealtimeStatus,
   listenRttConnectionStatus,
+  setRttPlotDecimation,
   sendConnectedRttCommands,
   type GyroRealtimeSampleEvent,
   type GyroRealtimeStatusEvent,
@@ -88,6 +89,7 @@ type ConnectedRttCommandOptions = {
 };
 
 type IcmGyroSample = {
+  seq: number;
   timestampMs: number;
   gx: number;
   gy: number;
@@ -95,6 +97,7 @@ type IcmGyroSample = {
 };
 
 type IcmAccelSample = {
+  seq: number;
   timestampMs: number;
   ax: number;
   ay: number;
@@ -140,9 +143,15 @@ const TAB_LABELS: Record<TabKey, string> = {
   calibration: "Calibration",
 };
 
-const PLOT_MAX_POINTS = 400;
+const PLOT_MAX_POINTS = 2400;
 const PLOT_MAX_BUFFERED_SAMPLES = 1200;
-const PLOT_MIN_FRAME_MS = 33;
+const PLOT_MIN_FRAME_MS = 16;
+const PLOT_TIME_WINDOW_S = 4;
+const PLOT_RETENTION_MULTIPLIER = 1.5;
+const PLOT_LOW_RATE_NO_DECIMATION_THRESHOLD_HZ = 80;
+const PLOT_HIGH_RATE_TARGET_EVENT_HZ = 80;
+const PLOT_TARGET_UPDATES_PER_SECOND = 30;
+const PLOT_MAX_FRAME_DT_S = 0.1;
 
 function toTimestamp(): string {
   return new Date().toISOString().replace("T", " ").replace("Z", "");
@@ -219,76 +228,6 @@ function createDefaultEstimate(): IcmCalibrationEstimate {
   };
 }
 
-function stripAnsiSequences(input: string): string {
-  return input.replace(/\u001b\[[0-9;]*[A-Za-z]/g, "");
-}
-
-function parseIcmGyroSamples(lines: string[]): IcmGyroSample[] {
-  const samples: IcmGyroSample[] = [];
-
-  for (const rawLine of lines) {
-    const line = stripAnsiSequences(rawLine);
-    const start = line.indexOf("RTT_IMU,ICM45686,");
-    if (start < 0) {
-      continue;
-    }
-
-    const fields = line.slice(start).split(",");
-    if (fields.length < 11) {
-      continue;
-    }
-
-    const timestampMs = Number(fields[3]);
-    const gx = Number(fields[8]);
-    const gy = Number(fields[9]);
-    const gz = Number(fields[10]);
-
-    if (
-      Number.isFinite(timestampMs) &&
-      Number.isFinite(gx) &&
-      Number.isFinite(gy) &&
-      Number.isFinite(gz)
-    ) {
-      samples.push({ timestampMs, gx, gy, gz });
-    }
-  }
-
-  return samples;
-}
-
-function parseIcmAccelSamples(lines: string[]): IcmAccelSample[] {
-  const samples: IcmAccelSample[] = [];
-
-  for (const rawLine of lines) {
-    const line = stripAnsiSequences(rawLine);
-    const start = line.indexOf("RTT_IMU,ICM45686,");
-    if (start < 0) {
-      continue;
-    }
-
-    const fields = line.slice(start).split(",");
-    if (fields.length < 8) {
-      continue;
-    }
-
-    const timestampMs = Number(fields[3]);
-    const ax = Number(fields[5]);
-    const ay = Number(fields[6]);
-    const az = Number(fields[7]);
-
-    if (
-      Number.isFinite(timestampMs) &&
-      Number.isFinite(ax) &&
-      Number.isFinite(ay) &&
-      Number.isFinite(az)
-    ) {
-      samples.push({ timestampMs, ax, ay, az });
-    }
-  }
-
-  return samples;
-}
-
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>("target");
   const [board, setBoard] = useState<BoardCode>("ass");
@@ -311,6 +250,7 @@ export default function App() {
 
   const [odrHz, setOdrHz] = useState("200");
   const [streamHz, setStreamHz] = useState("200");
+  const [plotDecimation, setPlotDecimation] = useState("1");
 
   const [accelRangeG, setAccelRangeG] = useState("16");
   const [gyroRangeDps, setGyroRangeDps] = useState("2000");
@@ -320,7 +260,6 @@ export default function App() {
 
   const [bnoRaw, setBnoRaw] = useState(true);
   const [bno6dof, setBno6dof] = useState(true);
-  const [bno9dof, setBno9dof] = useState(true);
 
   const [captureSeconds, setCaptureSeconds] = useState("30");
   const [gyroBiasSeconds, setGyroBiasSeconds] = useState("5");
@@ -335,8 +274,15 @@ export default function App() {
   const [accelRealtimePlotEnabled, setAccelRealtimePlotEnabled] = useState(false);
   const [accelRealtimePlotRunning, setAccelRealtimePlotRunning] = useState(false);
   const [accelPlotHasData, setAccelPlotHasData] = useState(false);
+  const [gyroDebugIncomingHz, setGyroDebugIncomingHz] = useState(0);
+  const [gyroDebugQueueDepth, setGyroDebugQueueDepth] = useState(0);
+  const [gyroDebugRenderLagMs, setGyroDebugRenderLagMs] = useState(0);
+  const [accelDebugIncomingHz, setAccelDebugIncomingHz] = useState(0);
+  const [accelDebugQueueDepth, setAccelDebugQueueDepth] = useState(0);
+  const [accelDebugRenderLagMs, setAccelDebugRenderLagMs] = useState(0);
   const [runtimeStreamRunning, setRuntimeStreamRunning] = useState(false);
   const [rttConnected, setRttConnected] = useState(false);
+  const [appliedPlotDecimation, setAppliedPlotDecimation] = useState(1);
 
   const [terminalCommand, setTerminalCommand] = useState("");
   const [autoScrollTerminal, setAutoScrollTerminal] = useState(true);
@@ -352,6 +298,8 @@ export default function App() {
   const terminalLogRef = useRef<HTMLDivElement | null>(null);
   const terminalResizeStartYRef = useRef(0);
   const terminalResizeStartHeightRef = useRef(140);
+  const gyroRealtimePlotRunningRef = useRef(false);
+  const accelRealtimePlotRunningRef = useRef(false);
   const gyroSampleUnlistenRef = useRef<(() => void) | null>(null);
   const gyroStatusUnlistenRef = useRef<(() => void) | null>(null);
   const accelSampleUnlistenRef = useRef<(() => void) | null>(null);
@@ -367,8 +315,29 @@ export default function App() {
   const accelPlotHasDataRef = useRef(false);
   const gyroPendingSamplesRef = useRef<IcmGyroSample[]>([]);
   const accelPendingSamplesRef = useRef<IcmAccelSample[]>([]);
+  const gyroPendingStartRef = useRef(0);
+  const accelPendingStartRef = useRef(0);
   const plotFlushRafRef = useRef<number | null>(null);
   const plotLastFlushMsRef = useRef(0);
+  const plotLastFrameTimeMsRef = useRef<number | null>(null);
+  const plotDisplayTimeSRef = useRef(0);
+  const gyroLastSeqRef = useRef<number | null>(null);
+  const accelLastSeqRef = useRef<number | null>(null);
+  const gyroObservedSeqStepRef = useRef<number | null>(null);
+  const accelObservedSeqStepRef = useRef<number | null>(null);
+  const gyroDropCountRef = useRef(0);
+  const accelDropCountRef = useRef(0);
+  const gyroDropLogTsRef = useRef(0);
+  const accelDropLogTsRef = useRef(0);
+  const gyroRateWindowStartMsRef = useRef<number | null>(null);
+  const accelRateWindowStartMsRef = useRef<number | null>(null);
+  const gyroRateCountRef = useRef(0);
+  const accelRateCountRef = useRef(0);
+  const gyroIncomingHzRef = useRef(0);
+  const accelIncomingHzRef = useRef(0);
+  const gyroLastEnqueueTsMsRef = useRef<number | null>(null);
+  const accelLastEnqueueTsMsRef = useRef<number | null>(null);
+  const appliedPlotDecimationRef = useRef(1);
   const gyroCanvasRefs = useRef<Record<GyroAxisKey, HTMLCanvasElement | null>>({
     gx: null,
     gy: null,
@@ -393,9 +362,9 @@ export default function App() {
 
   useEffect(() => {
     const tabsForImu: TabKey[] =
-      imu === "icm45686"
-        ? ["target", "firmware", "runtime", "gyroCalibration", "accelCalibration"]
-        : ["target", "firmware", "runtime", "calibration"];
+      imu === "bno086"
+        ? ["target", "firmware", "runtime", "gyroCalibration", "accelCalibration", "calibration"]
+        : ["target", "firmware", "runtime", "gyroCalibration", "accelCalibration"];
 
     if (!tabsForImu.includes(activeTab)) {
       setActiveTab("target");
@@ -462,13 +431,43 @@ export default function App() {
             setRuntimeStreamRunning(false);
             setGyroRealtimePlotRunning(false);
             setAccelRealtimePlotRunning(false);
+            const defaultDecimation = currentEffectivePlotDecimationRatio();
+            applyLocalPlotDecimation(defaultDecimation);
+            gyroRealtimePlotRunningRef.current = false;
+            accelRealtimePlotRunningRef.current = false;
             gyroPendingSamplesRef.current = [];
             accelPendingSamplesRef.current = [];
+            gyroPendingStartRef.current = 0;
+            accelPendingStartRef.current = 0;
+            gyroLastSeqRef.current = null;
+            accelLastSeqRef.current = null;
+            gyroObservedSeqStepRef.current = null;
+            accelObservedSeqStepRef.current = null;
+            gyroDropCountRef.current = 0;
+            accelDropCountRef.current = 0;
+            gyroDropLogTsRef.current = 0;
+            accelDropLogTsRef.current = 0;
+            gyroRateWindowStartMsRef.current = null;
+            accelRateWindowStartMsRef.current = null;
+            gyroRateCountRef.current = 0;
+            accelRateCountRef.current = 0;
+            gyroIncomingHzRef.current = 0;
+            accelIncomingHzRef.current = 0;
+            gyroLastEnqueueTsMsRef.current = null;
+            accelLastEnqueueTsMsRef.current = null;
+            setGyroDebugIncomingHz(0);
+            setGyroDebugQueueDepth(0);
+            setGyroDebugRenderLagMs(0);
+            setAccelDebugIncomingHz(0);
+            setAccelDebugQueueDepth(0);
+            setAccelDebugRenderLagMs(0);
             if (plotFlushRafRef.current !== null) {
               window.cancelAnimationFrame(plotFlushRafRef.current);
               plotFlushRafRef.current = null;
             }
             plotLastFlushMsRef.current = 0;
+            plotLastFrameTimeMsRef.current = null;
+            plotDisplayTimeSRef.current = 0;
             clearGyroRealtimeListeners();
             clearAccelRealtimeListeners();
           }
@@ -510,12 +509,101 @@ export default function App() {
   }, [accelRealtimePlotEnabled]);
 
   useEffect(() => {
+    gyroRealtimePlotRunningRef.current = gyroRealtimePlotRunning;
+    accelRealtimePlotRunningRef.current = accelRealtimePlotRunning;
+    if (gyroRealtimePlotRunning || accelRealtimePlotRunning) {
+      schedulePlotFlush();
+    }
+  }, [gyroRealtimePlotRunning, accelRealtimePlotRunning]);
+
+  useEffect(() => {
+    gyroLastSeqRef.current = null;
+    accelLastSeqRef.current = null;
+    gyroObservedSeqStepRef.current = null;
+    accelObservedSeqStepRef.current = null;
+    gyroDropCountRef.current = 0;
+    accelDropCountRef.current = 0;
+    gyroDropLogTsRef.current = 0;
+    accelDropLogTsRef.current = 0;
+    gyroRateWindowStartMsRef.current = null;
+    accelRateWindowStartMsRef.current = null;
+    gyroRateCountRef.current = 0;
+    accelRateCountRef.current = 0;
+    gyroIncomingHzRef.current = 0;
+    accelIncomingHzRef.current = 0;
+  }, [plotDecimation, streamHz, odrHz, appliedPlotDecimation]);
+
+  useEffect(() => {
+    if (!rttConnected) {
+      const defaultDecimation = currentEffectivePlotDecimationRatio();
+      applyLocalPlotDecimation(defaultDecimation);
+      return;
+    }
+
+    const targetDecimation = currentEffectivePlotDecimationRatio();
+    const handle = window.setTimeout(() => {
+      void syncRttPlotDecimation(targetDecimation, true);
+    }, 200);
+
+    return () => {
+      window.clearTimeout(handle);
+    };
+  }, [rttConnected, plotDecimation, streamHz, odrHz]);
+
+  useEffect(() => {
+    const handle = window.setInterval(() => {
+      const nowMs = performance.now();
+
+      const gyroLastEnqueue = gyroLastEnqueueTsMsRef.current;
+      const accelLastEnqueue = accelLastEnqueueTsMsRef.current;
+      if (gyroLastEnqueue === null || nowMs - gyroLastEnqueue > 1500) {
+        gyroIncomingHzRef.current = 0;
+      }
+      if (accelLastEnqueue === null || nowMs - accelLastEnqueue > 1500) {
+        accelIncomingHzRef.current = 0;
+      }
+
+      const gyroQueueDepth = pendingSampleCount(gyroPendingSamplesRef.current, gyroPendingStartRef.current);
+      const accelQueueDepth = pendingSampleCount(
+        accelPendingSamplesRef.current,
+        accelPendingStartRef.current,
+      );
+
+      const gyroRenderedTs = gyroPlotLastTimestampMsRef.current;
+      const accelRenderedTs = accelPlotLastTimestampMsRef.current;
+      const gyroRenderLagMs =
+        gyroLastEnqueue !== null && gyroRenderedTs !== null
+          ? Math.max(0, gyroLastEnqueue - gyroRenderedTs)
+          : 0;
+      const accelRenderLagMs =
+        accelLastEnqueue !== null && accelRenderedTs !== null
+          ? Math.max(0, accelLastEnqueue - accelRenderedTs)
+          : 0;
+
+      setGyroDebugIncomingHz(gyroIncomingHzRef.current);
+      setGyroDebugQueueDepth(gyroQueueDepth);
+      setGyroDebugRenderLagMs(gyroRenderLagMs);
+      setAccelDebugIncomingHz(accelIncomingHzRef.current);
+      setAccelDebugQueueDepth(accelQueueDepth);
+      setAccelDebugRenderLagMs(accelRenderLagMs);
+    }, 200);
+
+    return () => {
+      window.clearInterval(handle);
+    };
+  }, []);
+
+  useEffect(() => {
     return () => {
       if (plotFlushRafRef.current !== null) {
         window.cancelAnimationFrame(plotFlushRafRef.current);
         plotFlushRafRef.current = null;
       }
       plotLastFlushMsRef.current = 0;
+      plotLastFrameTimeMsRef.current = null;
+      plotDisplayTimeSRef.current = 0;
+      gyroPendingStartRef.current = 0;
+      accelPendingStartRef.current = 0;
       void stopGyroRealtimePlot();
       void stopAccelRealtimePlot();
       void disconnectRttSession();
@@ -533,12 +621,54 @@ export default function App() {
     setLogs((prev) => [...prev, { ts: toTimestamp(), level, text }]);
   }
 
+  function applyLocalPlotDecimation(value: number) {
+    const applied = Math.max(1, Math.floor(value || 1));
+    appliedPlotDecimationRef.current = applied;
+    setAppliedPlotDecimation(applied);
+  }
+
+  async function syncRttPlotDecimation(target: number, logOnError = false): Promise<number> {
+    const normalized = Math.max(1, Math.floor(target || 1));
+
+    if (!rttConnected) {
+      applyLocalPlotDecimation(normalized);
+      return normalized;
+    }
+
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const applied = await setRttPlotDecimation(normalized);
+        applyLocalPlotDecimation(applied);
+        return applied;
+      } catch (error) {
+        lastError = error;
+        if (attempt === 0) {
+          await new Promise((resolve) => window.setTimeout(resolve, 120));
+        }
+      }
+    }
+
+    applyLocalPlotDecimation(normalized);
+    if (logOnError) {
+      const message = lastError instanceof Error ? lastError.message : String(lastError);
+      pushLog("error", `failed to sync RTT plot decimation: ${message}`);
+    }
+    return normalized;
+  }
+
   async function refreshRttConnectionStatus() {
     try {
       const status = await getRttConnectionStatus();
       setRttConnected(status.connected);
+      if (!status.connected) {
+        const defaultDecimation = currentEffectivePlotDecimationRatio();
+        applyLocalPlotDecimation(defaultDecimation);
+      }
     } catch {
       setRttConnected(false);
+      const defaultDecimation = currentEffectivePlotDecimationRatio();
+      applyLocalPlotDecimation(defaultDecimation);
     }
   }
 
@@ -549,6 +679,8 @@ export default function App() {
       const disconnected = await disconnectRttSession();
       setRttConnected(false);
       setRuntimeStreamRunning(false);
+      const defaultDecimation = currentEffectivePlotDecimationRatio();
+      applyLocalPlotDecimation(defaultDecimation);
       if (!disconnected && logWhenAlreadyDisconnected) {
         pushLog("info", "RTT was already disconnected");
       }
@@ -563,12 +695,16 @@ export default function App() {
   async function onConnectRtt() {
     setBusy(true);
     try {
+      const requestedDecimation = currentEffectivePlotDecimationRatio();
       await connectRttSession(currentRttConnectRequest());
       setRttConnected(true);
       setRuntimeStreamRunning(false);
+      await syncRttPlotDecimation(requestedDecimation, true);
       lastAppliedRuntimeRef.current = null;
     } catch (error) {
       setRttConnected(false);
+      const defaultDecimation = currentEffectivePlotDecimationRatio();
+      applyLocalPlotDecimation(defaultDecimation);
       const message = error instanceof Error ? error.message : String(error);
       pushLog("error", message);
     } finally {
@@ -633,6 +769,7 @@ export default function App() {
       rtt_telnet_port: parsePositiveIntOr(rttTelnetPort, 19025),
       connect_timeout_ms: parsePositiveIntOr(connectTimeoutMs, 10000),
       ack_timeout_ms: parsePositiveIntOr(ackTimeoutMs, 2000),
+      plot_decimation: currentEffectivePlotDecimationRatio(),
       nrfjprog: nrfjprogPath.trim() || null,
       jlink_gdb_server: jlinkGdbServerPath.trim() || null,
     };
@@ -685,6 +822,7 @@ export default function App() {
       await connectRttSession(currentRttConnectRequest());
       setRttConnected(true);
       setRuntimeStreamRunning(false);
+      await syncRttPlotDecimation(currentEffectivePlotDecimationRatio(), true);
       pushLog("info", "RTT reconnected after exclusive calibration command");
     } catch (error) {
       setRttConnected(false);
@@ -765,7 +903,21 @@ export default function App() {
     gyroPlotHasDataRef.current = false;
     setGyroPlotHasData(false);
     gyroPendingSamplesRef.current = [];
+    gyroPendingStartRef.current = 0;
+    gyroLastSeqRef.current = null;
+    gyroObservedSeqStepRef.current = null;
+    gyroDropCountRef.current = 0;
+    gyroDropLogTsRef.current = 0;
+    gyroRateWindowStartMsRef.current = null;
+    gyroRateCountRef.current = 0;
+    gyroIncomingHzRef.current = 0;
+    gyroLastEnqueueTsMsRef.current = null;
+    setGyroDebugIncomingHz(0);
+    setGyroDebugQueueDepth(0);
+    setGyroDebugRenderLagMs(0);
     plotLastFlushMsRef.current = 0;
+    plotLastFrameTimeMsRef.current = null;
+    plotDisplayTimeSRef.current = 0;
     drawAllPlotCanvases();
   }
 
@@ -776,7 +928,21 @@ export default function App() {
     accelPlotHasDataRef.current = false;
     setAccelPlotHasData(false);
     accelPendingSamplesRef.current = [];
+    accelPendingStartRef.current = 0;
+    accelLastSeqRef.current = null;
+    accelObservedSeqStepRef.current = null;
+    accelDropCountRef.current = 0;
+    accelDropLogTsRef.current = 0;
+    accelRateWindowStartMsRef.current = null;
+    accelRateCountRef.current = 0;
+    accelIncomingHzRef.current = 0;
+    accelLastEnqueueTsMsRef.current = null;
+    setAccelDebugIncomingHz(0);
+    setAccelDebugQueueDepth(0);
+    setAccelDebugRenderLagMs(0);
     plotLastFlushMsRef.current = 0;
+    plotLastFrameTimeMsRef.current = null;
+    plotDisplayTimeSRef.current = 0;
     drawAllPlotCanvases();
   }
 
@@ -791,9 +957,10 @@ export default function App() {
     ref.textContent = `${value.toFixed(4)} ${unit}`;
   }
 
-  function drawAxisCanvas<T>(
+  function drawAxisCanvas<T extends { t: number }>(
     canvas: HTMLCanvasElement | null,
     points: T[],
+    displayTimeS: number,
     readValue: (point: T) => number,
     strokeColor: string,
   ): number | null {
@@ -820,19 +987,32 @@ export default function App() {
     context.setTransform(dpr, 0, 0, dpr, 0, 0);
     context.clearRect(0, 0, cssWidth, cssHeight);
 
-    if (points.length < 2) {
-      if (points.length === 1) {
-        return readValue(points[0]);
+    const padding = 10;
+    const drawableWidth = Math.max(1, cssWidth - padding * 2);
+    const drawableHeight = Math.max(1, cssHeight - padding * 2);
+    const clampedDisplayTimeS = Math.max(0, displayTimeS);
+    const earliestVisibleTimeS = Math.max(0, clampedDisplayTimeS - PLOT_TIME_WINDOW_S);
+    let startIdx = 0;
+    while (startIdx < points.length && points[startIdx].t < earliestVisibleTimeS) {
+      startIdx += 1;
+    }
+    let endIdx = points.length - 1;
+    while (endIdx >= startIdx && points[endIdx].t > clampedDisplayTimeS) {
+      endIdx -= 1;
+    }
+    const visibleCount = endIdx >= startIdx ? endIdx - startIdx + 1 : 0;
+
+    if (visibleCount < 2) {
+      if (visibleCount === 1) {
+        return readValue(points[startIdx]);
       }
       return null;
     }
 
-    const padding = 10;
-    const drawableWidth = Math.max(1, cssWidth - padding * 2);
-    const drawableHeight = Math.max(1, cssHeight - padding * 2);
     let maxAbs = 1;
 
-    for (const point of points) {
+    for (let idx = startIdx; idx <= endIdx; idx += 1) {
+      const point = points[idx];
       const magnitude = Math.abs(readValue(point));
       if (Number.isFinite(magnitude) && magnitude > maxAbs) {
         maxAbs = magnitude;
@@ -854,66 +1034,112 @@ export default function App() {
     context.lineTo(cssWidth - padding, zeroLineY);
     context.stroke();
 
-    const targetSegments = Math.max(60, Math.floor(drawableWidth));
-    const stride = Math.max(1, Math.floor(points.length / targetSegments));
+    const visibleSpanS = Math.max(1e-6, PLOT_TIME_WINDOW_S);
+    const timeToX = (timeS: number) =>
+      padding + ((timeS - earliestVisibleTimeS) / visibleSpanS) * drawableWidth;
+
+    const targetSegments = Math.max(80, Math.floor(drawableWidth));
+    const stride = Math.max(1, Math.floor(visibleCount / targetSegments));
 
     context.strokeStyle = strokeColor;
     context.lineWidth = 2;
     context.beginPath();
 
-    for (let idx = 0; idx < points.length; idx += stride) {
+    let firstDrawn = true;
+    for (let idx = startIdx; idx <= endIdx; idx += stride) {
       const value = readValue(points[idx]);
-      const x = padding + (idx / Math.max(1, points.length - 1)) * drawableWidth;
+      const x = timeToX(points[idx].t);
       const y = valueToY(value);
-      if (idx === 0) {
+      if (firstDrawn) {
         context.moveTo(x, y);
+        firstDrawn = false;
       } else {
         context.lineTo(x, y);
       }
     }
 
-    const lastIndex = points.length - 1;
+    const lastIndex = endIdx;
     const lastValue = readValue(points[lastIndex]);
-    const lastX = padding + (lastIndex / Math.max(1, points.length - 1)) * drawableWidth;
+    const lastX = timeToX(points[lastIndex].t);
     const lastY = valueToY(lastValue);
     context.lineTo(lastX, lastY);
+    if (points[lastIndex].t < clampedDisplayTimeS) {
+      context.lineTo(timeToX(clampedDisplayTimeS), lastY);
+    }
     context.stroke();
 
     return lastValue;
   }
 
   function drawAllPlotCanvases() {
+    const displayTimeS = plotDisplayTimeSRef.current;
     const gyroPoints = gyroPlotPointsRef.current;
     const accelPoints = accelPlotPointsRef.current;
 
     updatePlotValue(
       gyroValueRefs.current.gx,
-      drawAxisCanvas(gyroCanvasRefs.current.gx, gyroPoints, (point) => point.gx, "#ef7f45"),
+      drawAxisCanvas(
+        gyroCanvasRefs.current.gx,
+        gyroPoints,
+        displayTimeS,
+        (point) => point.gx,
+        "#ef7f45",
+      ),
       "dps",
     );
     updatePlotValue(
       gyroValueRefs.current.gy,
-      drawAxisCanvas(gyroCanvasRefs.current.gy, gyroPoints, (point) => point.gy, "#0d8f9a"),
+      drawAxisCanvas(
+        gyroCanvasRefs.current.gy,
+        gyroPoints,
+        displayTimeS,
+        (point) => point.gy,
+        "#0d8f9a",
+      ),
       "dps",
     );
     updatePlotValue(
       gyroValueRefs.current.gz,
-      drawAxisCanvas(gyroCanvasRefs.current.gz, gyroPoints, (point) => point.gz, "#4a77ff"),
+      drawAxisCanvas(
+        gyroCanvasRefs.current.gz,
+        gyroPoints,
+        displayTimeS,
+        (point) => point.gz,
+        "#4a77ff",
+      ),
       "dps",
     );
     updatePlotValue(
       accelValueRefs.current.ax,
-      drawAxisCanvas(accelCanvasRefs.current.ax, accelPoints, (point) => point.ax, "#ff6f61"),
+      drawAxisCanvas(
+        accelCanvasRefs.current.ax,
+        accelPoints,
+        displayTimeS,
+        (point) => point.ax,
+        "#ff6f61",
+      ),
       "m/s²",
     );
     updatePlotValue(
       accelValueRefs.current.ay,
-      drawAxisCanvas(accelCanvasRefs.current.ay, accelPoints, (point) => point.ay, "#2a9d8f"),
+      drawAxisCanvas(
+        accelCanvasRefs.current.ay,
+        accelPoints,
+        displayTimeS,
+        (point) => point.ay,
+        "#2a9d8f",
+      ),
       "m/s²",
     );
     updatePlotValue(
       accelValueRefs.current.az,
-      drawAxisCanvas(accelCanvasRefs.current.az, accelPoints, (point) => point.az, "#3a86ff"),
+      drawAxisCanvas(
+        accelCanvasRefs.current.az,
+        accelPoints,
+        displayTimeS,
+        (point) => point.az,
+        "#3a86ff",
+      ),
       "m/s²",
     );
   }
@@ -931,7 +1157,7 @@ export default function App() {
     for (const sample of samples) {
       let t = 0;
       if (lastTimestampMs === null) {
-        t = 0;
+        t = plotDisplayTimeSRef.current;
       } else {
         const deltaMs = sample.timestampMs - lastTimestampMs;
         const dt = deltaMs > 0 && deltaMs < 1000 ? deltaMs / 1000 : fallbackDt;
@@ -951,6 +1177,19 @@ export default function App() {
 
     if (points.length > PLOT_MAX_POINTS) {
       points.splice(0, points.length - PLOT_MAX_POINTS);
+    }
+
+    const retentionCutoffS = Math.max(
+      0,
+      Math.max(lastTimeS, plotDisplayTimeSRef.current) -
+        PLOT_TIME_WINDOW_S * PLOT_RETENTION_MULTIPLIER,
+    );
+    let staleCount = 0;
+    while (staleCount < points.length && points[staleCount].t < retentionCutoffS) {
+      staleCount += 1;
+    }
+    if (staleCount > 0) {
+      points.splice(0, staleCount);
     }
 
     gyroPlotLastTimestampMsRef.current = lastTimestampMs;
@@ -976,7 +1215,7 @@ export default function App() {
     for (const sample of samples) {
       let t = 0;
       if (lastTimestampMs === null) {
-        t = 0;
+        t = plotDisplayTimeSRef.current;
       } else {
         const deltaMs = sample.timestampMs - lastTimestampMs;
         const dt = deltaMs > 0 && deltaMs < 1000 ? deltaMs / 1000 : fallbackDt;
@@ -998,6 +1237,19 @@ export default function App() {
       points.splice(0, points.length - PLOT_MAX_POINTS);
     }
 
+    const retentionCutoffS = Math.max(
+      0,
+      Math.max(lastTimeS, plotDisplayTimeSRef.current) -
+        PLOT_TIME_WINDOW_S * PLOT_RETENTION_MULTIPLIER,
+    );
+    let staleCount = 0;
+    while (staleCount < points.length && points[staleCount].t < retentionCutoffS) {
+      staleCount += 1;
+    }
+    if (staleCount > 0) {
+      points.splice(0, staleCount);
+    }
+
     accelPlotLastTimestampMsRef.current = lastTimestampMs;
     accelPlotLastTimeSRef.current = lastTimeS;
 
@@ -1008,36 +1260,125 @@ export default function App() {
     }
   }
 
+  function shouldKeepPlotFlushLoopAlive(): boolean {
+    return (
+      gyroRealtimePlotRunningRef.current ||
+      accelRealtimePlotRunningRef.current ||
+      pendingSampleCount(gyroPendingSamplesRef.current, gyroPendingStartRef.current) > 0 ||
+      pendingSampleCount(accelPendingSamplesRef.current, accelPendingStartRef.current) > 0
+    );
+  }
+
+  function maxSamplesPerFrame(frameDtS: number): number {
+    const effectiveStreamHz = Math.max(
+      1,
+      parsePositiveIntOr(streamHz, parsePositiveIntOr(odrHz, 200)),
+    );
+    const safeFrameDtS = Math.max(1 / PLOT_TARGET_UPDATES_PER_SECOND, frameDtS);
+    const expectedSamplesThisFrame = Math.ceil(effectiveStreamHz * safeFrameDtS);
+    return Math.max(1, Math.min(256, expectedSamplesThisFrame + 1));
+  }
+
+  function pendingSampleCount<T>(pending: T[], startIndex: number): number {
+    return Math.max(0, pending.length - startIndex);
+  }
+
+  function maybeCompactPendingQueue<T>(
+    pending: T[],
+    startRef: { current: number },
+    force = false,
+  ) {
+    const startIndex = startRef.current;
+    if (startIndex <= 0) {
+      return;
+    }
+
+    if (force || startIndex >= pending.length) {
+      pending.length = 0;
+      startRef.current = 0;
+      return;
+    }
+
+    if (startIndex >= 512 && startIndex * 2 >= pending.length) {
+      pending.splice(0, startIndex);
+      startRef.current = 0;
+    }
+  }
+
+  function stopPlotFlushLoopIfIdle() {
+    if (shouldKeepPlotFlushLoopAlive()) {
+      return;
+    }
+    if (plotFlushRafRef.current !== null) {
+      window.cancelAnimationFrame(plotFlushRafRef.current);
+      plotFlushRafRef.current = null;
+    }
+    plotLastFlushMsRef.current = 0;
+    plotLastFrameTimeMsRef.current = null;
+  }
+
   function schedulePlotFlush() {
     if (plotFlushRafRef.current !== null) {
       return;
     }
 
     const flushOnFrame = (frameTimeMs: number) => {
-      if (frameTimeMs - plotLastFlushMsRef.current < PLOT_MIN_FRAME_MS) {
-        plotFlushRafRef.current = window.requestAnimationFrame(flushOnFrame);
-        return;
-      }
-
       plotFlushRafRef.current = null;
-      plotLastFlushMsRef.current = frameTimeMs;
 
-      if (gyroPendingSamplesRef.current.length > 0) {
-        const gyroBatch = gyroPendingSamplesRef.current;
-        gyroPendingSamplesRef.current = [];
-        appendGyroPlotSamples(gyroBatch);
+      const previousFrameTimeMs = plotLastFrameTimeMsRef.current;
+      let frameDtS = 1 / PLOT_TARGET_UPDATES_PER_SECOND;
+      if (previousFrameTimeMs !== null) {
+        frameDtS = Math.max(
+          0,
+          Math.min(PLOT_MAX_FRAME_DT_S, (frameTimeMs - previousFrameTimeMs) / 1000),
+        );
+        if (gyroRealtimePlotRunningRef.current || accelRealtimePlotRunningRef.current) {
+          plotDisplayTimeSRef.current += frameDtS;
+        }
+      }
+      plotLastFrameTimeMsRef.current = frameTimeMs;
+
+      if (frameTimeMs - plotLastFlushMsRef.current >= PLOT_MIN_FRAME_MS) {
+        plotLastFlushMsRef.current = frameTimeMs;
+        const frameSampleBudget = maxSamplesPerFrame(frameDtS);
+
+        const gyroPending = gyroPendingSamplesRef.current;
+        const gyroAvailable = pendingSampleCount(gyroPending, gyroPendingStartRef.current);
+        if (gyroAvailable > 0) {
+          const gyroTake = Math.min(frameSampleBudget, gyroAvailable);
+          const gyroStart = gyroPendingStartRef.current;
+          const gyroBatch = gyroPending.slice(gyroStart, gyroStart + gyroTake);
+          gyroPendingStartRef.current = gyroStart + gyroTake;
+          maybeCompactPendingQueue(gyroPending, gyroPendingStartRef, false);
+          appendGyroPlotSamples(gyroBatch);
+        }
+
+        const accelPending = accelPendingSamplesRef.current;
+        const accelAvailable = pendingSampleCount(accelPending, accelPendingStartRef.current);
+        if (accelAvailable > 0) {
+          const accelTake = Math.min(frameSampleBudget, accelAvailable);
+          const accelStart = accelPendingStartRef.current;
+          const accelBatch = accelPending.slice(accelStart, accelStart + accelTake);
+          accelPendingStartRef.current = accelStart + accelTake;
+          maybeCompactPendingQueue(accelPending, accelPendingStartRef, false);
+          appendAccelPlotSamples(accelBatch);
+        }
+
+        if (
+          gyroRealtimePlotRunningRef.current ||
+          accelRealtimePlotRunningRef.current ||
+          gyroPlotPointsRef.current.length > 0 ||
+          accelPlotPointsRef.current.length > 0
+        ) {
+          drawAllPlotCanvases();
+        }
       }
 
-      if (accelPendingSamplesRef.current.length > 0) {
-        const accelBatch = accelPendingSamplesRef.current;
-        accelPendingSamplesRef.current = [];
-        appendAccelPlotSamples(accelBatch);
-      }
-
-      drawAllPlotCanvases();
-
-      if (gyroPendingSamplesRef.current.length > 0 || accelPendingSamplesRef.current.length > 0) {
-        schedulePlotFlush();
+      if (shouldKeepPlotFlushLoopAlive()) {
+        plotFlushRafRef.current = window.requestAnimationFrame(flushOnFrame);
+      } else {
+        plotLastFlushMsRef.current = 0;
+        plotLastFrameTimeMsRef.current = null;
       }
     };
 
@@ -1045,19 +1386,45 @@ export default function App() {
   }
 
   function queueGyroPlotSample(sample: IcmGyroSample) {
-    gyroPendingSamplesRef.current.push(sample);
+    if (!shouldQueueGyroSample(sample)) {
+      return;
+    }
+    recordIncomingRate(
+      sample.timestampMs,
+      gyroRateWindowStartMsRef,
+      gyroRateCountRef,
+      gyroIncomingHzRef,
+      gyroLastEnqueueTsMsRef,
+    );
+    const pending = gyroPendingSamplesRef.current;
+    pending.push(sample);
+    const activeCount = pendingSampleCount(pending, gyroPendingStartRef.current);
     const maxBuffered = PLOT_MAX_BUFFERED_SAMPLES;
-    if (gyroPendingSamplesRef.current.length > maxBuffered) {
-      gyroPendingSamplesRef.current = gyroPendingSamplesRef.current.slice(-maxBuffered);
+    if (activeCount > maxBuffered) {
+      gyroPendingStartRef.current += activeCount - maxBuffered;
+      maybeCompactPendingQueue(pending, gyroPendingStartRef, false);
     }
     schedulePlotFlush();
   }
 
   function queueAccelPlotSample(sample: IcmAccelSample) {
-    accelPendingSamplesRef.current.push(sample);
+    if (!shouldQueueAccelSample(sample)) {
+      return;
+    }
+    recordIncomingRate(
+      sample.timestampMs,
+      accelRateWindowStartMsRef,
+      accelRateCountRef,
+      accelIncomingHzRef,
+      accelLastEnqueueTsMsRef,
+    );
+    const pending = accelPendingSamplesRef.current;
+    pending.push(sample);
+    const activeCount = pendingSampleCount(pending, accelPendingStartRef.current);
     const maxBuffered = PLOT_MAX_BUFFERED_SAMPLES;
-    if (accelPendingSamplesRef.current.length > maxBuffered) {
-      accelPendingSamplesRef.current = accelPendingSamplesRef.current.slice(-maxBuffered);
+    if (activeCount > maxBuffered) {
+      accelPendingStartRef.current += activeCount - maxBuffered;
+      maybeCompactPendingQueue(pending, accelPendingStartRef, false);
     }
     schedulePlotFlush();
   }
@@ -1108,11 +1475,137 @@ export default function App() {
     );
   }
 
+  function currentPlotDecimationRatio(): number {
+    return Math.max(1, parsePositiveIntOr(plotDecimation, 1));
+  }
+
+  function currentEffectivePlotDecimationRatio(): number {
+    const requested = currentPlotDecimationRatio();
+    const effectiveStreamHz = Math.max(
+      1,
+      parsePositiveIntOr(streamHz, parsePositiveIntOr(odrHz, 200)),
+    );
+    if (effectiveStreamHz <= PLOT_LOW_RATE_NO_DECIMATION_THRESHOLD_HZ) {
+      return 1;
+    }
+    const highRateAuto = Math.max(
+      1,
+      Math.ceil(effectiveStreamHz / PLOT_HIGH_RATE_TARGET_EVENT_HZ),
+    );
+    return Math.max(requested, highRateAuto);
+  }
+
+  function recordIncomingRate(
+    timestampMs: number,
+    windowStartRef: { current: number | null },
+    countRef: { current: number },
+    hzRef: { current: number },
+    lastEnqueueRef: { current: number | null },
+  ) {
+    if (!Number.isFinite(timestampMs)) {
+      return;
+    }
+
+    lastEnqueueRef.current = timestampMs;
+
+    if (windowStartRef.current === null) {
+      windowStartRef.current = timestampMs;
+      countRef.current = 1;
+      return;
+    }
+
+    countRef.current += 1;
+    const elapsedMs = timestampMs - windowStartRef.current;
+    if (elapsedMs >= 1000) {
+      hzRef.current = (countRef.current * 1000) / Math.max(1, elapsedMs);
+      windowStartRef.current = timestampMs;
+      countRef.current = 0;
+    }
+  }
+
+  function trackDroppedFrames(
+    label: string,
+    seq: number,
+    lastSeqRef: { current: number | null },
+    observedStepRef: { current: number | null },
+    droppedRef: { current: number },
+    lastLogTsRef: { current: number },
+  ) {
+    const ratio = Math.max(
+      1,
+      rttConnected ? appliedPlotDecimationRef.current : currentEffectivePlotDecimationRatio(),
+    );
+    if (!Number.isFinite(seq) || seq <= 0) {
+      lastSeqRef.current = Number.isFinite(seq) ? seq : null;
+      observedStepRef.current = null;
+      droppedRef.current = 0;
+      return;
+    }
+
+    const previousSeq = lastSeqRef.current;
+    if (previousSeq !== null) {
+      const seqDelta = seq - previousSeq;
+      if (seqDelta > 0) {
+        const observedStep = observedStepRef.current;
+        if (observedStep === null || seqDelta < observedStep) {
+          observedStepRef.current = seqDelta;
+        }
+
+        const expectedStep = Math.max(1, ratio, observedStepRef.current ?? ratio);
+        if (seqDelta > expectedStep) {
+          droppedRef.current += seqDelta - expectedStep;
+        }
+      } else {
+        observedStepRef.current = null;
+        droppedRef.current = 0;
+      }
+    }
+    lastSeqRef.current = seq;
+
+    const now = Date.now();
+    if (droppedRef.current > 0 && now - lastLogTsRef.current >= 1000) {
+      pushLog("error", `${label} stream: dropped ${droppedRef.current} sample(s)`);
+      droppedRef.current = 0;
+      lastLogTsRef.current = now;
+    }
+  }
+
+  function shouldQueueGyroSample(sample: IcmGyroSample): boolean {
+    trackDroppedFrames(
+      "gyro plot",
+      sample.seq,
+      gyroLastSeqRef,
+      gyroObservedSeqStepRef,
+      gyroDropCountRef,
+      gyroDropLogTsRef,
+    );
+
+    return true;
+  }
+
+  function shouldQueueAccelSample(sample: IcmAccelSample): boolean {
+    if (!gyroRealtimePlotRunning) {
+      trackDroppedFrames(
+        "accel plot",
+        sample.seq,
+        accelLastSeqRef,
+        accelObservedSeqStepRef,
+        accelDropCountRef,
+        accelDropLogTsRef,
+      );
+    }
+
+    return true;
+  }
+
   async function stopGyroRealtimePlot() {
     const wasRunning = gyroRealtimePlotRunning;
     setGyroRealtimePlotRunning(false);
+    gyroRealtimePlotRunningRef.current = false;
     gyroPendingSamplesRef.current = [];
+    gyroPendingStartRef.current = 0;
     clearGyroRealtimeListeners();
+    stopPlotFlushLoopIfIdle();
     if (wasRunning) {
       pushLog("info", "gyro real-time plotting stopped");
     }
@@ -1131,11 +1624,6 @@ export default function App() {
   }, [logs]);
 
   async function startGyroRealtimePlot() {
-    if (imu !== "icm45686") {
-      pushLog("error", "real-time gyro plotting is available only for ICM45686");
-      return;
-    }
-
     if (!gyroRealtimePlotEnabled) {
       pushLog("error", "enable real-time plotting first");
       return;
@@ -1148,12 +1636,15 @@ export default function App() {
     clearGyroRealtimeListeners();
     resetGyroPlot();
     setGyroRealtimePlotRunning(true);
+    gyroRealtimePlotRunningRef.current = true;
+    schedulePlotFlush();
 
     try {
       const unlistenSamples = await listenGyroRealtimeSamples(
         (payload: GyroRealtimeSampleEvent) => {
           queueGyroPlotSample({
-            timestampMs: payload.timestamp_ms,
+            seq: payload.seq,
+            timestampMs: performance.now(),
             gx: payload.gx,
             gy: payload.gy,
             gz: payload.gz,
@@ -1179,7 +1670,9 @@ export default function App() {
       }
     } catch (error) {
       setGyroRealtimePlotRunning(false);
+      gyroRealtimePlotRunningRef.current = false;
       clearGyroRealtimeListeners();
+      stopPlotFlushLoopIfIdle();
       const message = error instanceof Error ? error.message : String(error);
       pushLog("error", message);
     }
@@ -1188,19 +1681,17 @@ export default function App() {
   async function stopAccelRealtimePlot() {
     const wasRunning = accelRealtimePlotRunning;
     setAccelRealtimePlotRunning(false);
+    accelRealtimePlotRunningRef.current = false;
     accelPendingSamplesRef.current = [];
+    accelPendingStartRef.current = 0;
     clearAccelRealtimeListeners();
+    stopPlotFlushLoopIfIdle();
     if (wasRunning) {
       pushLog("info", "accelerometer real-time plotting stopped");
     }
   }
 
   async function startAccelRealtimePlot() {
-    if (imu !== "icm45686") {
-      pushLog("error", "real-time accelerometer plotting is available only for ICM45686");
-      return;
-    }
-
     if (!accelRealtimePlotEnabled) {
       pushLog("error", "enable real-time accelerometer plotting first");
       return;
@@ -1213,12 +1704,15 @@ export default function App() {
     clearAccelRealtimeListeners();
     resetAccelPlot();
     setAccelRealtimePlotRunning(true);
+    accelRealtimePlotRunningRef.current = true;
+    schedulePlotFlush();
 
     try {
       const unlistenSamples = await listenGyroRealtimeSamples(
         (payload: GyroRealtimeSampleEvent) => {
           queueAccelPlotSample({
-            timestampMs: payload.timestamp_ms,
+            seq: payload.seq,
+            timestampMs: performance.now(),
             ax: payload.ax,
             ay: payload.ay,
             az: payload.az,
@@ -1244,7 +1738,9 @@ export default function App() {
       }
     } catch (error) {
       setAccelRealtimePlotRunning(false);
+      accelRealtimePlotRunningRef.current = false;
       clearAccelRealtimeListeners();
+      stopPlotFlushLoopIfIdle();
       const message = error instanceof Error ? error.message : String(error);
       pushLog("error", message);
     }
@@ -1290,7 +1786,7 @@ export default function App() {
 
     if (imu === "icm45686") {
       const params: RuntimeParamCommand[] = [
-        { key: "stream_format", value: "CSV", command: "STREAM_FORMAT CSV" },
+        { key: "stream_format", value: "BIN", command: "STREAM_FORMAT BIN" },
         {
           key: "stream_hz",
           value: streamHz.trim() || "200",
@@ -1340,7 +1836,7 @@ export default function App() {
     }
 
     const params: RuntimeParamCommand[] = [
-      { key: "stream_format", value: "CSV", command: "STREAM_FORMAT CSV" },
+      { key: "stream_format", value: "BIN", command: "STREAM_FORMAT BIN" },
       {
         key: "stream_hz",
         value: streamHz.trim() || "100",
@@ -1360,11 +1856,6 @@ export default function App() {
         key: "bno_6dof",
         value: encodeBool(bno6dof),
         command: `BNO_6DOF ${encodeBool(bno6dof)}`,
-      },
-      {
-        key: "bno_9dof",
-        value: encodeBool(bno9dof),
-        command: `BNO_9DOF ${encodeBool(bno9dof)}`,
       },
     ];
 
@@ -1417,14 +1908,27 @@ export default function App() {
       return;
     }
 
-    const output = await runConnectedRttCommands(
-      [plan.imuCommand, ...plan.params.map((entry) => entry.command), "APPLY", "STATUS"],
+    const applyOutput = await runConnectedRttCommands(
+      [plan.imuCommand, ...plan.params.map((entry) => entry.command), "APPLY"],
       { logPrefix: "RTT APPLY" },
     );
-    if (output !== null) {
-      lastAppliedRuntimeRef.current = plan.snapshot;
-      setRuntimeStreamRunning(false);
+    if (applyOutput === null) {
+      return;
     }
+
+    lastAppliedRuntimeRef.current = plan.snapshot;
+    setRuntimeStreamRunning(false);
+
+    const statusOutput = await runConnectedRttCommands(["STATUS"], {
+      logPrefix: "RTT APPLY_STATUS",
+    });
+    if (statusOutput === null) {
+      pushLog(
+        "info",
+        "configuration was applied, but STATUS did not reply in time; you can retry STATUS manually",
+      );
+    }
+    await syncRttPlotDecimation(currentEffectivePlotDecimationRatio(), true);
   }
 
   async function onStatus() {
@@ -1446,6 +1950,7 @@ export default function App() {
   }
 
   async function onStartStream() {
+    await syncRttPlotDecimation(currentEffectivePlotDecimationRatio(), true);
     const output = await runConnectedRttCommands(["START"]);
     if (output !== null) {
       setRuntimeStreamRunning(true);
@@ -1462,11 +1967,6 @@ export default function App() {
   }
 
   async function onCaptureIcmCalibration(computeGyro: boolean, computeAccel: boolean) {
-    if (imu !== "icm45686") {
-      pushLog("error", "capture+compute is currently implemented for ICM45686");
-      return;
-    }
-
     if (!computeGyro && !computeAccel) {
       pushLog("error", "select at least one calculation mode (gyro or accel)");
       return;
@@ -1483,6 +1983,7 @@ export default function App() {
     let output: unknown | null = null;
     try {
       output = await captureIcmCalibrationConnected({
+        imu_model: imu,
         serial_number: serial.trim() || null,
         device_name: deviceName.trim() || "nRF52840_xxAA",
         speed_khz: parsePositiveIntOr(speedKhz, 4000),
@@ -1504,7 +2005,10 @@ export default function App() {
         low_noise: lowNoise,
         fifo: fifo,
         fifo_hires: fifoHires,
+        bno_raw: imu === "bno086" ? true : bnoRaw,
+        bno_6dof: bno6dof,
         keep_stream_running: keepStreamRunningDuringAndAfterCapture,
+        plot_decimation: currentEffectivePlotDecimationRatio(),
       });
       pushLog("info", "RTT CAPTURE_CAL (connected session)");
       pushLog("info", JSON.stringify(output, null, 2));
@@ -1538,9 +2042,6 @@ export default function App() {
         `Gyro calibration computed. gyro_samples=${output.estimate.gyro_sample_count}, gyro_bias=[${output.estimate.gyro_bias_dps.map((v) => v.toFixed(5)).join(", ")}]`,
       );
 
-      if (gyroRealtimePlotEnabled && !gyroRealtimePlotRunning) {
-        appendGyroPlotSamples(parseIcmGyroSamples(output.responses));
-      }
     }
 
     if (output.computed_accel) {
@@ -1554,9 +2055,6 @@ export default function App() {
         `Accel calibration computed. samples=${output.estimate.sample_count}, rms=${output.estimate.residual_rms_mps2.toFixed(5)}, max=${output.estimate.residual_max_mps2.toFixed(5)}`,
       );
 
-      if (accelRealtimePlotEnabled && !accelRealtimePlotRunning) {
-        appendAccelPlotSamples(parseIcmAccelSamples(output.responses));
-      }
     }
 
     setLastEstimate(merged);
@@ -1564,11 +2062,6 @@ export default function App() {
   }
 
   async function onWriteIcmCalibration(writeGyro: boolean, writeAccelCal: boolean) {
-    if (imu !== "icm45686") {
-      pushLog("error", "write calibration is currently implemented for ICM45686");
-      return;
-    }
-
     if (!writeGyro && !writeAccelCal) {
       pushLog("error", "select at least one calibration to write (gyro or accel)");
       return;
@@ -1601,6 +2094,8 @@ export default function App() {
       ...globalArgs(),
       "icm-write-cal",
       ...rttOptionArgs(),
+      "--imu",
+      imu,
       "--odr-hz",
       odrHz.trim() || "200",
       "--accel-range-g",
@@ -1613,6 +2108,10 @@ export default function App() {
       encodeBool(fifo),
       "--fifo-hires",
       encodeBool(fifoHires),
+      "--bno-raw",
+      encodeBool(bnoRaw),
+      "--bno-6dof",
+      encodeBool(bno6dof),
       "--write-gyro-bias",
       encodeBool(writeGyro),
       "--write-accel",
@@ -1931,6 +2430,16 @@ export default function App() {
             <input type="number" value={streamHz} onChange={(event) => setStreamHz(event.target.value)} />
           </label>
 
+          <label>
+            Plot Decimation
+            <input
+              type="number"
+              min="1"
+              value={plotDecimation}
+              onChange={(event) => setPlotDecimation(event.target.value)}
+            />
+          </label>
+
           {imu === "icm45686" ? (
             <label>
               Accel Range (g)
@@ -1981,13 +2490,7 @@ export default function App() {
               </select>
             </label>
           ) : (
-            <label>
-              BNO 9DOF
-              <select value={encodeBool(bno9dof)} onChange={(event) => setBno9dof(event.target.value === "1")}>
-                <option value="1">Enabled</option>
-                <option value="0">Disabled</option>
-              </select>
-            </label>
+            <div />
           )}
 
           {imu === "icm45686" ? (
@@ -2019,6 +2522,21 @@ export default function App() {
           RTT commands in this tab use the persistent connection. Use the Connect / Disconnect
           buttons in the top bar.
         </p>
+        <p className="info-note">
+          Plot Decimation controls UI plotting load only. `1` = plot every sample, `2` = every
+          second sample. For low stream rates ({"<="} 80 Hz), decimation is forced to `1` so updates
+          remain sample-by-sample. For high stream rates, the app may increase effective decimation
+          automatically to keep RTT/UI throughput stable.
+        </p>
+        <p className="info-note">
+          Effective plot decimation: <strong>{currentEffectivePlotDecimationRatio()}</strong>
+          {rttConnected ? (
+            <>
+              {" "}
+              | Applied in RTT session: <strong>{appliedPlotDecimation}</strong>
+            </>
+          ) : null}
+        </p>
 
         <label className="checkbox-inline">
           <input
@@ -2048,15 +2566,6 @@ export default function App() {
   }
 
   function renderGyroCalibrationTab() {
-    if (imu !== "icm45686") {
-      return (
-        <div className="tab-content-block">
-          <h2 className="section-title">Gyroscope Calibration</h2>
-          <p className="info-note">Gyroscope host calibration is available only for ICM45686.</p>
-        </div>
-      );
-    }
-
     return (
       <div className="tab-content-block">
         <h2 className="section-title">Gyroscope Calibration</h2>
@@ -2145,6 +2654,19 @@ export default function App() {
           </>
         ) : null}
 
+        <h3 className="section-subtitle">Gyro Plot Debug</h3>
+        <div className="grid grid-3">
+          <div className="info-note">
+            Incoming rate: <strong>{gyroDebugIncomingHz.toFixed(1)} Hz</strong>
+          </div>
+          <div className="info-note">
+            Queue depth: <strong>{gyroDebugQueueDepth}</strong>
+          </div>
+          <div className="info-note">
+            Render lag: <strong>{gyroDebugRenderLagMs.toFixed(1)} ms</strong>
+          </div>
+        </div>
+
         <h3 className="section-subtitle">Last Gyro Estimate</h3>
         {hasGyroEstimate && lastEstimate ? (
           <pre className="mono-block">
@@ -2165,15 +2687,6 @@ export default function App() {
   }
 
   function renderAccelCalibrationTab() {
-    if (imu !== "icm45686") {
-      return (
-        <div className="tab-content-block">
-          <h2 className="section-title">Accelerometer Calibration</h2>
-          <p className="info-note">Accelerometer host calibration is available only for ICM45686.</p>
-        </div>
-      );
-    }
-
     return (
       <div className="tab-content-block">
         <h2 className="section-title">Accelerometer Calibration</h2>
@@ -2254,6 +2767,19 @@ export default function App() {
           </>
         ) : null}
 
+        <h3 className="section-subtitle">Accel Plot Debug</h3>
+        <div className="grid grid-3">
+          <div className="info-note">
+            Incoming rate: <strong>{accelDebugIncomingHz.toFixed(1)} Hz</strong>
+          </div>
+          <div className="info-note">
+            Queue depth: <strong>{accelDebugQueueDepth}</strong>
+          </div>
+          <div className="info-note">
+            Render lag: <strong>{accelDebugRenderLagMs.toFixed(1)} ms</strong>
+          </div>
+        </div>
+
         <h3 className="section-subtitle">Last Accel Estimate</h3>
         {hasAccelEstimate && lastEstimate ? (
           <pre className="mono-block">
@@ -2325,9 +2851,16 @@ export default function App() {
 
       <nav className="tabs" aria-label="Workflow tabs">
         {(
-          imu === "icm45686"
-            ? (["target", "firmware", "runtime", "gyroCalibration", "accelCalibration"] as TabKey[])
-            : (["target", "firmware", "runtime", "calibration"] as TabKey[])
+          imu === "bno086"
+            ? ([
+                "target",
+                "firmware",
+                "runtime",
+                "gyroCalibration",
+                "accelCalibration",
+                "calibration",
+              ] as TabKey[])
+            : (["target", "firmware", "runtime", "gyroCalibration", "accelCalibration"] as TabKey[])
         ).map((tab) => (
           <button
             key={tab}

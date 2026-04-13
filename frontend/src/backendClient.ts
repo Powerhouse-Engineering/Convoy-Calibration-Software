@@ -5,6 +5,7 @@ export type BackendCallResult = {
 };
 
 export type GyroRealtimeStreamRequest = {
+  imu_model: "icm45686" | "bno086";
   serial_number: string | null;
   device_name: string;
   speed_khz: number;
@@ -19,11 +20,15 @@ export type GyroRealtimeStreamRequest = {
   low_noise: boolean;
   fifo: boolean;
   fifo_hires: boolean;
+  bno_raw: boolean;
+  bno_6dof: boolean;
+  plot_decimation: number;
   nrfjprog: string | null;
   jlink_gdb_server: string | null;
 };
 
 export type GyroRealtimeSampleEvent = {
+  seq: number;
   timestamp_ms: number;
   ax: number;
   ay: number;
@@ -46,6 +51,7 @@ export type RttConnectRequest = {
   rtt_telnet_port: number;
   connect_timeout_ms: number;
   ack_timeout_ms: number;
+  plot_decimation: number;
   nrfjprog: string | null;
   jlink_gdb_server: string | null;
 };
@@ -65,6 +71,7 @@ export type RttConnectionStatusEvent = {
 };
 
 export type IcmConnectedCaptureRequest = {
+  imu_model: "icm45686" | "bno086";
   serial_number: string | null;
   device_name: string;
   speed_khz: number;
@@ -86,7 +93,10 @@ export type IcmConnectedCaptureRequest = {
   low_noise: boolean;
   fifo: boolean;
   fifo_hires: boolean;
+  bno_raw: boolean;
+  bno_6dof: boolean;
   keep_stream_running: boolean;
+  plot_decimation: number;
 };
 
 type InvokeFn = (command: string, payload?: Record<string, unknown>) => Promise<unknown>;
@@ -206,6 +216,21 @@ export async function getRttConnectionStatus(): Promise<RttConnectionStatus> {
   const result = await invoke("rtt_connection_status");
   const maybe = result as Partial<RttConnectionStatus>;
   return { connected: maybe.connected === true };
+}
+
+export async function setRttPlotDecimation(plotDecimation: number): Promise<number> {
+  const invoke = await resolveInvoke();
+  if (!invoke) {
+    throw new Error("Tauri backend bridge is not connected.");
+  }
+  const result = await invoke("set_rtt_plot_decimation", {
+    plotDecimation: Math.max(1, Math.floor(plotDecimation || 1)),
+  });
+  const value = Number(result);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error("invalid RTT plot decimation response");
+  }
+  return Math.floor(value);
 }
 
 export async function sendConnectedRttCommands(

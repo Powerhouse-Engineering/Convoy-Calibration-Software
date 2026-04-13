@@ -2,10 +2,10 @@
 
 The calibration firmware supports two streaming modes:
 
-- `STREAM_FORMAT CSV`: legacy text lines on RTT up channel `0`.
-- `STREAM_FORMAT BIN`: compact binary IMU frames on RTT up channel `1`.
+- `STREAM_FORMAT CSV`: legacy text lines.
+- `STREAM_FORMAT BIN`: compact binary IMU frames.
 
-Command/ACK traffic remains text on channel `0` in both modes.
+In the current calibration build, binary frames and command/ACK traffic share RTT channel `0`.
 
 ## Frame Header (16 bytes, little-endian)
 

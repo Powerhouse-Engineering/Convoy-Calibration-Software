@@ -1,7 +1,7 @@
 use calibration_backend::{
-    BackendConfig, BackendError, BoardTarget, CalibrationBackend, EraseStrategy,
-    FlashRequest, IcmCalibrationEstimate, IcmCaptureCalibrationRequest, IcmWriteCalibrationRequest,
-    ImuModel, RttCommandRequest,
+    BackendConfig, BackendError, BoardTarget, CalibrationBackend, EraseStrategy, FlashRequest,
+    IcmCalibrationEstimate, IcmCaptureCalibrationRequest, IcmWriteCalibrationRequest, ImuModel,
+    RttCommandRequest,
 };
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -142,6 +142,9 @@ enum Command {
         #[arg(long, default_value_t = 80)]
         min_accel_points: usize,
 
+        #[arg(long, default_value = "icm45686")]
+        imu: String,
+
         #[arg(long, default_value_t = 200)]
         odr_hz: u32,
 
@@ -162,6 +165,18 @@ enum Command {
 
         #[arg(long, default_value_t = false)]
         fifo_hires: bool,
+
+        #[arg(long, default_value_t = true)]
+        bno_raw: bool,
+
+        #[arg(long, default_value_t = true)]
+        bno_6dof: bool,
+
+        #[arg(long, default_value_t = false)]
+        keep_stream_running: bool,
+
+        #[arg(long, default_value_t = 1)]
+        plot_decimation: u32,
     },
     IcmWriteCal {
         #[arg(long)]
@@ -185,6 +200,9 @@ enum Command {
         #[arg(long, default_value_t = 2_000)]
         ack_timeout_ms: u64,
 
+        #[arg(long, default_value = "icm45686")]
+        imu: String,
+
         #[arg(long, default_value_t = 200)]
         odr_hz: u32,
 
@@ -202,6 +220,12 @@ enum Command {
 
         #[arg(long, default_value_t = false)]
         fifo_hires: bool,
+
+        #[arg(long, default_value_t = true)]
+        bno_raw: bool,
+
+        #[arg(long, default_value_t = true)]
+        bno_6dof: bool,
 
         #[arg(long, default_value = "true")]
         write_gyro_bias: String,
@@ -362,6 +386,7 @@ fn run() -> Result<(), BackendError> {
             min_total_samples,
             min_gyro_samples,
             min_accel_points,
+            imu,
             odr_hz,
             stream_hz,
             accel_range_g,
@@ -369,6 +394,10 @@ fn run() -> Result<(), BackendError> {
             low_noise,
             fifo,
             fifo_hires,
+            bno_raw,
+            bno_6dof,
+            keep_stream_running,
+            plot_decimation,
         } => {
             let request = IcmCaptureCalibrationRequest {
                 serial_number,
@@ -385,6 +414,7 @@ fn run() -> Result<(), BackendError> {
                 min_total_samples,
                 min_gyro_samples,
                 min_accel_points,
+                imu_model: parse_imu_model(&imu)?,
                 odr_hz,
                 stream_hz,
                 accel_range_g,
@@ -392,6 +422,10 @@ fn run() -> Result<(), BackendError> {
                 low_noise,
                 fifo,
                 fifo_hires,
+                bno_raw,
+                bno_6dof,
+                keep_stream_running,
+                plot_decimation,
             };
 
             let result = backend.capture_icm_calibration(request)?;
@@ -405,12 +439,15 @@ fn run() -> Result<(), BackendError> {
             rtt_telnet_port,
             connect_timeout_ms,
             ack_timeout_ms,
+            imu,
             odr_hz,
             accel_range_g,
             gyro_range_dps,
             low_noise,
             fifo,
             fifo_hires,
+            bno_raw,
+            bno_6dof,
             write_gyro_bias,
             write_accel,
             estimate_json,
@@ -424,12 +461,15 @@ fn run() -> Result<(), BackendError> {
                 rtt_telnet_port,
                 connect_timeout_ms,
                 ack_timeout_ms,
+                imu_model: parse_imu_model(&imu)?,
                 odr_hz,
                 accel_range_g,
                 gyro_range_dps,
                 low_noise,
                 fifo,
                 fifo_hires,
+                bno_raw,
+                bno_6dof,
                 write_gyro_bias: parse_bool_arg(&write_gyro_bias, "--write-gyro-bias")?,
                 write_accel: parse_bool_arg(&write_accel, "--write-accel")?,
                 estimate,

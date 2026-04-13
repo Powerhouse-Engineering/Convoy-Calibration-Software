@@ -1,6 +1,6 @@
 use crate::calibration::{
     ensure_min_total_samples, estimate_accel_ellipsoid_with_min_points,
-    estimate_gyro_bias_with_min_samples, parse_icm_csv_sample,
+    estimate_gyro_bias_with_min_samples, parse_icm_binary_sample,
 };
 use crate::config::BackendConfig;
 use crate::manifest::FirmwareManifest;
@@ -8,7 +8,7 @@ use crate::process::{run_command, tail_lines};
 use crate::rtt_text::{RttServerConfig, RttSession};
 use crate::types::{
     BuildRequest, BuildResult, FlashRequest, FlashResult, IcmCaptureCalibrationRequest,
-    IcmCaptureCalibrationResult, IcmWriteCalibrationRequest, IcmWriteCalibrationResult,
+    IcmCaptureCalibrationResult, IcmWriteCalibrationRequest, IcmWriteCalibrationResult, ImuModel,
     RttCommandRequest, RttCommandResult, ToolStatus, ToolchainStatus,
 };
 use crate::{BackendError, Result};
@@ -34,7 +34,8 @@ impl CalibrationBackend {
     pub fn check_tools(&self) -> ToolchainStatus {
         ToolchainStatus {
             nrfjprog: self.detect_tool(&self.config.nrfjprog_executable, &["--version"]),
-            jlink_gdb_server: self.detect_tool(&self.config.jlink_gdb_server_executable, &["-version"]),
+            jlink_gdb_server: self
+                .detect_tool(&self.config.jlink_gdb_server_executable, &["-version"]),
         }
     }
 
@@ -198,18 +199,7 @@ impl CalibrationBackend {
         let ack_timeout = Duration::from_millis(request.ack_timeout_ms.max(500));
         let mut responses = Vec::<String>::new();
 
-        self.send_icm_setup_commands(
-            &mut session,
-            request.odr_hz,
-            request.stream_hz,
-            request.accel_range_g,
-            request.gyro_range_dps,
-            request.low_noise,
-            request.fifo,
-            request.fifo_hires,
-            ack_timeout,
-            &mut responses,
-        )?;
+        self.send_capture_setup_commands(&mut session, &request, ack_timeout, &mut responses)?;
 
         let start_result = session.send_command_and_wait_ack("START", ack_timeout)?;
         responses.extend(start_result.lines);
@@ -221,13 +211,9 @@ impl CalibrationBackend {
 
         while Instant::now() < capture_deadline {
             let read_deadline = Instant::now() + Duration::from_millis(200);
-            if let Some(line) = session.read_line_until(read_deadline)? {
-                if samples.len() < 100 || responses.len() < 300 {
-                    responses.push(line.clone());
-                }
-
+            if let Some(frame) = session.read_binary_frame_until(read_deadline)? {
                 if let Some(sample) =
-                    parse_icm_csv_sample(&line, capture_start.elapsed().as_secs_f32())
+                    parse_icm_binary_sample(&frame, capture_start.elapsed().as_secs_f32())
                 {
                     samples.push(sample);
                 }
@@ -375,34 +361,9 @@ impl CalibrationBackend {
         let ack_timeout = Duration::from_millis(request.ack_timeout_ms.max(500));
         let mut commands = Vec::new();
 
-        commands.push(session.send_command_and_wait_ack("IMU ICM45686", ack_timeout)?);
-        commands.push(
-            session.send_command_and_wait_ack(
-                &format!("ODR {}", request.odr_hz.max(1)),
-                ack_timeout,
-            )?,
-        );
-        commands.push(session.send_command_and_wait_ack(
-            &format!("ACCEL_RANGE {}", request.accel_range_g),
-            ack_timeout,
-        )?);
-        commands.push(session.send_command_and_wait_ack(
-            &format!("GYRO_RANGE {}", request.gyro_range_dps),
-            ack_timeout,
-        )?);
-        commands.push(session.send_command_and_wait_ack(
-            &format!("LOW_NOISE {}", if request.low_noise { 1 } else { 0 }),
-            ack_timeout,
-        )?);
-        commands.push(session.send_command_and_wait_ack(
-            &format!("FIFO {}", if request.fifo { 1 } else { 0 }),
-            ack_timeout,
-        )?);
-        commands.push(session.send_command_and_wait_ack(
-            &format!("FIFO_HIRES {}", if request.fifo_hires { 1 } else { 0 }),
-            ack_timeout,
-        )?);
-        commands.push(session.send_command_and_wait_ack("APPLY", ack_timeout)?);
+        for command in self.build_write_setup_commands(&request) {
+            commands.push(session.send_command_and_wait_ack(&command, ack_timeout)?);
+        }
 
         if request.write_gyro_bias {
             let gyro = request.estimate.gyro_bias_dps;
@@ -444,38 +405,69 @@ impl CalibrationBackend {
         Ok(IcmWriteCalibrationResult { commands })
     }
 
-    fn send_icm_setup_commands(
+    fn send_capture_setup_commands(
         &self,
         session: &mut RttSession,
-        odr_hz: u32,
-        stream_hz: u32,
-        accel_range_g: u32,
-        gyro_range_dps: u32,
-        low_noise: bool,
-        fifo: bool,
-        fifo_hires: bool,
+        request: &IcmCaptureCalibrationRequest,
         ack_timeout: Duration,
         responses: &mut Vec<String>,
     ) -> Result<()> {
-        let commands = [
-            "IMU ICM45686".to_string(),
-            "STREAM_FORMAT CSV".to_string(),
-            format!("STREAM_HZ {}", stream_hz.max(1)),
-            format!("ODR {}", odr_hz.max(1)),
-            format!("ACCEL_RANGE {}", accel_range_g),
-            format!("GYRO_RANGE {}", gyro_range_dps),
-            format!("LOW_NOISE {}", if low_noise { 1 } else { 0 }),
-            format!("FIFO {}", if fifo { 1 } else { 0 }),
-            format!("FIFO_HIRES {}", if fifo_hires { 1 } else { 0 }),
-            "APPLY".to_string(),
-        ];
+        let commands = self.build_capture_setup_commands(request);
 
-        for command in &commands {
-            let result = session.send_command_and_wait_ack(command, ack_timeout)?;
+        for command in commands {
+            let result = session.send_command_and_wait_ack(&command, ack_timeout)?;
             responses.extend(result.lines);
         }
 
         Ok(())
+    }
+
+    fn build_capture_setup_commands(&self, request: &IcmCaptureCalibrationRequest) -> Vec<String> {
+        match request.imu_model {
+            ImuModel::Icm45686 => vec![
+                "IMU ICM45686".to_string(),
+                "STREAM_FORMAT BIN".to_string(),
+                format!("STREAM_HZ {}", request.stream_hz.max(1)),
+                format!("ODR {}", request.odr_hz.max(1)),
+                format!("ACCEL_RANGE {}", request.accel_range_g),
+                format!("GYRO_RANGE {}", request.gyro_range_dps),
+                format!("LOW_NOISE {}", if request.low_noise { 1 } else { 0 }),
+                format!("FIFO {}", if request.fifo { 1 } else { 0 }),
+                format!("FIFO_HIRES {}", if request.fifo_hires { 1 } else { 0 }),
+                "APPLY".to_string(),
+            ],
+            ImuModel::Bno086 => vec![
+                "IMU BNO086".to_string(),
+                "STREAM_FORMAT BIN".to_string(),
+                format!("STREAM_HZ {}", request.stream_hz.max(1)),
+                format!("ODR {}", request.odr_hz.max(1)),
+                "BNO_RAW 1".to_string(),
+                format!("BNO_6DOF {}", if request.bno_6dof { 1 } else { 0 }),
+                "APPLY".to_string(),
+            ],
+        }
+    }
+
+    fn build_write_setup_commands(&self, request: &IcmWriteCalibrationRequest) -> Vec<String> {
+        match request.imu_model {
+            ImuModel::Icm45686 => vec![
+                "IMU ICM45686".to_string(),
+                format!("ODR {}", request.odr_hz.max(1)),
+                format!("ACCEL_RANGE {}", request.accel_range_g),
+                format!("GYRO_RANGE {}", request.gyro_range_dps),
+                format!("LOW_NOISE {}", if request.low_noise { 1 } else { 0 }),
+                format!("FIFO {}", if request.fifo { 1 } else { 0 }),
+                format!("FIFO_HIRES {}", if request.fifo_hires { 1 } else { 0 }),
+                "APPLY".to_string(),
+            ],
+            ImuModel::Bno086 => vec![
+                "IMU BNO086".to_string(),
+                format!("ODR {}", request.odr_hz.max(1)),
+                format!("BNO_RAW {}", if request.bno_raw { 1 } else { 0 }),
+                format!("BNO_6DOF {}", if request.bno_6dof { 1 } else { 0 }),
+                "APPLY".to_string(),
+            ],
+        }
     }
 
     fn open_rtt_session(
@@ -487,7 +479,8 @@ impl CalibrationBackend {
         rtt_telnet_port: u16,
         connect_timeout_ms: u64,
     ) -> Result<RttSession> {
-        let rtt_control_block_addr = self.detect_preferred_rtt_control_block(serial_number.as_deref());
+        let rtt_control_block_addr =
+            self.detect_preferred_rtt_control_block(serial_number.as_deref());
         let config = RttServerConfig {
             serial_number,
             device_name,

@@ -210,6 +210,8 @@ pub struct IcmCaptureCalibrationRequest {
     pub min_total_samples: usize,
     pub min_gyro_samples: usize,
     pub min_accel_points: usize,
+    #[serde(default = "default_imu_model")]
+    pub imu_model: ImuModel,
     pub odr_hz: u32,
     pub stream_hz: u32,
     pub accel_range_g: u32,
@@ -217,8 +219,14 @@ pub struct IcmCaptureCalibrationRequest {
     pub low_noise: bool,
     pub fifo: bool,
     pub fifo_hires: bool,
+    #[serde(default = "default_bno_raw")]
+    pub bno_raw: bool,
+    #[serde(default = "default_bno_6dof")]
+    pub bno_6dof: bool,
     #[serde(default)]
     pub keep_stream_running: bool,
+    #[serde(default = "default_plot_decimation")]
+    pub plot_decimation: u32,
 }
 
 impl Default for IcmCaptureCalibrationRequest {
@@ -238,6 +246,7 @@ impl Default for IcmCaptureCalibrationRequest {
             min_total_samples: 80,
             min_gyro_samples: 20,
             min_accel_points: 80,
+            imu_model: ImuModel::Icm45686,
             odr_hz: 200,
             stream_hz: 200,
             accel_range_g: 16,
@@ -245,9 +254,28 @@ impl Default for IcmCaptureCalibrationRequest {
             low_noise: true,
             fifo: true,
             fifo_hires: false,
+            bno_raw: true,
+            bno_6dof: true,
             keep_stream_running: false,
+            plot_decimation: 1,
         }
     }
+}
+
+fn default_plot_decimation() -> u32 {
+    1
+}
+
+fn default_imu_model() -> ImuModel {
+    ImuModel::Icm45686
+}
+
+fn default_bno_raw() -> bool {
+    true
+}
+
+fn default_bno_6dof() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,12 +306,18 @@ pub struct IcmWriteCalibrationRequest {
     pub rtt_telnet_port: u16,
     pub connect_timeout_ms: u64,
     pub ack_timeout_ms: u64,
+    #[serde(default = "default_imu_model")]
+    pub imu_model: ImuModel,
     pub odr_hz: u32,
     pub accel_range_g: u32,
     pub gyro_range_dps: u32,
     pub low_noise: bool,
     pub fifo: bool,
     pub fifo_hires: bool,
+    #[serde(default = "default_bno_raw")]
+    pub bno_raw: bool,
+    #[serde(default = "default_bno_6dof")]
+    pub bno_6dof: bool,
     pub write_gyro_bias: bool,
     pub write_accel: bool,
     pub estimate: IcmCalibrationEstimate,
@@ -299,12 +333,15 @@ impl Default for IcmWriteCalibrationRequest {
             rtt_telnet_port: 19025,
             connect_timeout_ms: 10_000,
             ack_timeout_ms: 2_000,
+            imu_model: ImuModel::Icm45686,
             odr_hz: 200,
             accel_range_g: 16,
             gyro_range_dps: 2000,
             low_noise: true,
             fifo: true,
             fifo_hires: false,
+            bno_raw: true,
+            bno_6dof: true,
             write_gyro_bias: true,
             write_accel: true,
             estimate: IcmCalibrationEstimate {

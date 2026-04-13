@@ -3,7 +3,7 @@
 use calibration_backend::{
     calibration::{
         ensure_min_total_samples, estimate_accel_ellipsoid_with_min_points,
-        estimate_gyro_bias_with_min_samples, parse_icm_csv_sample,
+        estimate_gyro_bias_with_min_samples, parse_icm_binary_sample,
     },
     BackendConfig, BoardTarget, CalibrationBackend, EraseStrategy, FlashRequest,
     IcmCalibrationEstimate, IcmCaptureCalibrationRequest, IcmCaptureCalibrationResult,
@@ -25,8 +25,22 @@ const GYRO_STREAM_SAMPLE_EVENT: &str = "gyro-stream-sample";
 const GYRO_STREAM_STATUS_EVENT: &str = "gyro-stream-status";
 const RTT_CONNECTION_STATUS_EVENT: &str = "rtt-connection-status";
 
+fn default_plot_decimation_u32() -> u32 {
+    1
+}
+
+fn default_imu_model() -> ImuModel {
+    ImuModel::Icm45686
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct GyroRealtimeStreamRequest {
+    #[serde(default = "default_imu_model")]
+    imu_model: ImuModel,
     serial_number: Option<String>,
     device_name: String,
     speed_khz: u32,
@@ -41,12 +55,19 @@ struct GyroRealtimeStreamRequest {
     low_noise: bool,
     fifo: bool,
     fifo_hires: bool,
+    #[serde(default = "default_true")]
+    bno_raw: bool,
+    #[serde(default = "default_true")]
+    bno_6dof: bool,
+    #[serde(default = "default_plot_decimation_u32")]
+    plot_decimation: u32,
     nrfjprog: Option<String>,
     jlink_gdb_server: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct GyroRealtimeSampleEvent {
+    seq: u32,
     timestamp_ms: u32,
     ax: f32,
     ay: f32,
@@ -86,6 +107,8 @@ struct PersistentRttConnectRequest {
     rtt_telnet_port: u16,
     connect_timeout_ms: u64,
     ack_timeout_ms: u64,
+    #[serde(default = "default_plot_decimation_u32")]
+    plot_decimation: u32,
     nrfjprog: Option<String>,
     jlink_gdb_server: Option<String>,
 }
@@ -104,6 +127,7 @@ struct RttConnectionStatus {
 struct PersistentRttConnection {
     session: calibration_backend::rtt_text::RttSession,
     ack_timeout: Duration,
+    plot_decimation: u32,
 }
 
 struct PersistentRttState {
@@ -230,13 +254,17 @@ fn start_gyro_stream_inner(
     let backend = CalibrationBackend::new(config);
     let mut session = backend
         .open_rtt_text_session(
-            request.serial_number.as_deref().map(str::trim).and_then(|value| {
-                if value.is_empty() {
-                    None
-                } else {
-                    Some(value.to_string())
-                }
-            }),
+            request
+                .serial_number
+                .as_deref()
+                .map(str::trim)
+                .and_then(|value| {
+                    if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    }
+                }),
             if request.device_name.trim().is_empty() {
                 "nRF52840_xxAA".to_string()
             } else {
@@ -252,39 +280,45 @@ fn start_gyro_stream_inner(
     let ack_timeout = Duration::from_millis(request.ack_timeout_ms.max(500));
     let _ = session.send_command_and_wait_ack("STOP", ack_timeout);
 
-    let setup_commands = [
-        "IMU ICM45686".to_string(),
-        "STREAM_FORMAT CSV".to_string(),
-        format!("STREAM_HZ {}", request.stream_hz.max(1)),
-        format!("ODR {}", request.odr_hz.max(1)),
-        format!("ACCEL_RANGE {}", request.accel_range_g),
-        format!("GYRO_RANGE {}", request.gyro_range_dps),
-        format!("LOW_NOISE {}", if request.low_noise { 1 } else { 0 }),
-        format!("FIFO {}", if request.fifo { 1 } else { 0 }),
-        format!("FIFO_HIRES {}", if request.fifo_hires { 1 } else { 0 }),
-        "APPLY".to_string(),
-        "START".to_string(),
-    ];
+    let mut setup_commands = build_imu_setup_commands(
+        request.imu_model,
+        request.odr_hz,
+        request.stream_hz,
+        request.accel_range_g,
+        request.gyro_range_dps,
+        request.low_noise,
+        request.fifo,
+        request.fifo_hires,
+        request.bno_raw,
+        request.bno_6dof,
+    );
+    setup_commands.push("START".to_string());
 
-    for command in &setup_commands {
+    for command in setup_commands {
         session
-            .send_command_and_wait_ack(command, ack_timeout)
+            .send_command_and_wait_ack(&command, ack_timeout)
             .map_err(|err| err.to_string())?;
     }
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_clone = Arc::clone(&stop_flag);
     let app_handle = app.clone();
+    let plot_decimation = request.plot_decimation.max(1);
 
     let worker = std::thread::spawn(move || {
         emit_gyro_stream_status(&app_handle, "info", "gyro stream connected");
+        let mut sample_emit_counter = 0u32;
 
         while !stop_flag_clone.load(Ordering::Relaxed) {
             let deadline = Instant::now() + Duration::from_millis(220);
-            match session.read_line_until(deadline) {
-                Ok(Some(line)) => {
-                    if let Some(sample) = parse_icm_csv_sample(&line, 0.0) {
+            match session.read_binary_frame_until(deadline) {
+                Ok(Some(frame)) => {
+                    if !should_emit_sample(plot_decimation, &mut sample_emit_counter) {
+                        continue;
+                    }
+                    if let Some(sample) = parse_icm_binary_sample(&frame, 0.0) {
                         let payload = GyroRealtimeSampleEvent {
+                            seq: sample.seq,
                             timestamp_ms: sample.timestamp_ms,
                             ax: sample.accel_mps2[0],
                             ay: sample.accel_mps2[1],
@@ -387,7 +421,12 @@ async fn connect_rtt(
         *last_request_guard = Some(request);
         drop(last_request_guard);
 
-        start_rtt_drainer(&rtt_current, &rtt_last_request, &rtt_drainer, app_handle.clone())?;
+        start_rtt_drainer(
+            &rtt_current,
+            &rtt_last_request,
+            &rtt_drainer,
+            app_handle.clone(),
+        )?;
         emit_rtt_connection_status(&app_handle, true, "RTT connected");
         Ok::<(), String>(())
     })
@@ -441,9 +480,10 @@ fn disconnect_rtt_inner(
         .map_err(|_| "persistent RTT state lock poisoned".to_string())?;
 
     if let Some(mut connection) = guard.take() {
-        let _ = connection
-            .session
-            .send_command_and_wait_ack("STOP", connection.ack_timeout.min(Duration::from_millis(1200)));
+        let _ = connection.session.send_command_and_wait_ack(
+            "STOP",
+            connection.ack_timeout.min(Duration::from_millis(1200)),
+        );
         Ok(true)
     } else {
         Ok(false)
@@ -451,7 +491,9 @@ fn disconnect_rtt_inner(
 }
 
 #[tauri::command]
-fn rtt_connection_status(state: tauri::State<PersistentRttState>) -> Result<RttConnectionStatus, String> {
+fn rtt_connection_status(
+    state: tauri::State<PersistentRttState>,
+) -> Result<RttConnectionStatus, String> {
     let guard = state
         .current
         .lock()
@@ -462,6 +504,33 @@ fn rtt_connection_status(state: tauri::State<PersistentRttState>) -> Result<RttC
 }
 
 #[tauri::command]
+fn set_rtt_plot_decimation(
+    state: tauri::State<PersistentRttState>,
+    plot_decimation: u32,
+) -> Result<u32, String> {
+    let applied = plot_decimation.max(1);
+    {
+        let mut guard = state
+            .last_request
+            .lock()
+            .map_err(|_| "persistent RTT request state lock poisoned".to_string())?;
+        if let Some(request) = guard.as_mut() {
+            request.plot_decimation = applied;
+        }
+    }
+    {
+        let mut guard = state
+            .current
+            .lock()
+            .map_err(|_| "persistent RTT state lock poisoned".to_string())?;
+        if let Some(connection) = guard.as_mut() {
+            connection.plot_decimation = applied;
+        }
+    }
+    Ok(applied)
+}
+
+#[tauri::command]
 async fn rtt_command_connected(
     app: tauri::AppHandle,
     rtt_state: tauri::State<'_, PersistentRttState>,
@@ -469,10 +538,11 @@ async fn rtt_command_connected(
 ) -> Result<Vec<RttCommandResult>, String> {
     let connection = Arc::clone(&rtt_state.current);
     let last_request = Arc::clone(&rtt_state.last_request);
+    let drainer = Arc::clone(&rtt_state.drainer);
     let app_handle = app.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
-        rtt_command_connected_inner(&app_handle, &connection, &last_request, request)
+        rtt_command_connected_inner(&app_handle, &connection, &last_request, &drainer, request)
     })
     .await
     .map_err(|err| format!("RTT command task join error: {err}"))?
@@ -482,73 +552,94 @@ fn rtt_command_connected_inner(
     app: &tauri::AppHandle,
     connection: &Arc<Mutex<Option<PersistentRttConnection>>>,
     last_request: &Arc<Mutex<Option<PersistentRttConnectRequest>>>,
+    drainer: &Arc<Mutex<Option<PersistentRttDrainer>>>,
     request: RttConnectedCommandRequest,
 ) -> Result<Vec<RttCommandResult>, String> {
     if request.commands.is_empty() {
         return Err("at least one RTT command is required".to_string());
     }
+    stop_rtt_drainer(drainer)?;
     let requested_ack_timeout = request
         .ack_timeout_ms
         .map(|value| Duration::from_millis(value.max(500)));
 
-    let mut last_retryable_error: Option<String> = None;
+    let result = (|| -> Result<Vec<RttCommandResult>, String> {
+        let mut last_retryable_error: Option<String> = None;
 
-    for attempt in 0..2 {
-        let mut results = Vec::with_capacity(request.commands.len());
-        let mut should_retry = false;
+        for attempt in 0..2 {
+            let mut results = Vec::with_capacity(request.commands.len());
+            let mut should_retry = false;
 
-        for command in &request.commands {
-            let send_result = {
-                let mut guard = connection
-                    .lock()
-                    .map_err(|_| "persistent RTT state lock poisoned".to_string())?;
+            for command in &request.commands {
+                let send_result = {
+                    let mut guard = connection
+                        .lock()
+                        .map_err(|_| "persistent RTT state lock poisoned".to_string())?;
 
-                let conn = guard
-                    .as_mut()
-                    .ok_or_else(|| "RTT is not connected. Use Connect first.".to_string())?;
+                    let conn = guard
+                        .as_mut()
+                        .ok_or_else(|| "RTT is not connected. Use Connect first.".to_string())?;
 
-                let ack_timeout = requested_ack_timeout.unwrap_or(conn.ack_timeout);
-                conn.session.send_command_and_wait_ack(command, ack_timeout)
-            };
+                    let ack_timeout = requested_ack_timeout.unwrap_or(conn.ack_timeout);
+                    conn.session.send_command_and_wait_ack(command, ack_timeout)
+                };
 
-            match send_result {
-                Ok(result) => results.push(result),
-                Err(err) => {
-                    if is_retryable_connection_io_error(&err) {
-                        if let Ok(mut guard) = connection.lock() {
-                            *guard = None;
+                match send_result {
+                    Ok(result) => results.push(result),
+                    Err(err) => {
+                        if is_retryable_connection_io_error(&err) {
+                            if let Ok(mut guard) = connection.lock() {
+                                *guard = None;
+                            }
+                            should_retry = true;
+                            last_retryable_error = Some(err.to_string());
+                            break;
                         }
-                        should_retry = true;
-                        last_retryable_error = Some(err.to_string());
-                        break;
+                        return Err(err.to_string());
                     }
-                    return Err(err.to_string());
                 }
             }
+
+            if !should_retry {
+                return Ok(results);
+            }
+
+            if attempt == 0 {
+                let reconnect_stop = Arc::new(AtomicBool::new(false));
+                if try_reconnect_persistent_rtt(connection, last_request, &reconnect_stop, app) {
+                    continue;
+                }
+            }
+            break;
         }
 
-        if !should_retry {
-            return Ok(results);
-        }
+        let message = last_retryable_error
+            .unwrap_or_else(|| "RTT command failed after reconnect".to_string());
+        emit_rtt_connection_status(app, false, format!("RTT command failed ({message})"));
+        Err(message)
+    })();
 
-        if attempt == 0 {
-            let reconnect_stop = Arc::new(AtomicBool::new(false));
-            if try_reconnect_persistent_rtt(
-                connection,
-                last_request,
-                &reconnect_stop,
-                app,
-            ) {
-                continue;
+    let should_restart = {
+        let has_connection = connection
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false);
+        let has_request = last_request
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false);
+        has_connection && has_request
+    };
+
+    if should_restart {
+        if let Err(err) = start_rtt_drainer(connection, last_request, drainer, app.clone()) {
+            if result.is_ok() {
+                return Err(err);
             }
         }
-        break;
     }
 
-    let message =
-        last_retryable_error.unwrap_or_else(|| "RTT command failed after reconnect".to_string());
-    emit_rtt_connection_status(app, false, format!("RTT command failed ({message})"));
-    Err(message)
+    result
 }
 
 #[tauri::command]
@@ -595,20 +686,24 @@ fn icm_capture_calibration_connected_inner(
         let mut responses = Vec::<String>::new();
 
         if !request.keep_stream_running {
-            let commands = [
-                "IMU ICM45686".to_string(),
-                "STREAM_FORMAT CSV".to_string(),
-                format!("STREAM_HZ {}", request.stream_hz.max(1)),
-                format!("ODR {}", request.odr_hz.max(1)),
-                format!("ACCEL_RANGE {}", request.accel_range_g),
-                format!("GYRO_RANGE {}", request.gyro_range_dps),
-                format!("LOW_NOISE {}", if request.low_noise { 1 } else { 0 }),
-                format!("FIFO {}", if request.fifo { 1 } else { 0 }),
-                format!("FIFO_HIRES {}", if request.fifo_hires { 1 } else { 0 }),
-                "APPLY".to_string(),
-            ];
+            let commands = build_imu_setup_commands(
+                request.imu_model,
+                request.odr_hz,
+                request.stream_hz,
+                request.accel_range_g,
+                request.gyro_range_dps,
+                request.low_noise,
+                request.fifo,
+                request.fifo_hires,
+                if request.imu_model == ImuModel::Bno086 {
+                    true
+                } else {
+                    request.bno_raw
+                },
+                request.bno_6dof,
+            );
 
-            for command in &commands {
+            for command in commands {
                 let command_result = {
                     let mut guard = current
                         .lock()
@@ -618,7 +713,7 @@ fn icm_capture_calibration_connected_inner(
                         .ok_or_else(|| "RTT is not connected. Use Connect first.".to_string())?;
                     connection
                         .session
-                        .send_command_and_wait_ack(command, ack_timeout)
+                        .send_command_and_wait_ack(&command, ack_timeout)
                         .map_err(|err| err.to_string())?
                 };
                 responses.extend(command_result.lines);
@@ -643,10 +738,12 @@ fn icm_capture_calibration_connected_inner(
         let capture_deadline = Instant::now() + Duration::from_secs_f32(capture_seconds);
         let capture_start = Instant::now();
         let mut samples = Vec::new();
+        let mut sample_emit_counter = 0u32;
+        let plot_decimation = request.plot_decimation.max(1);
 
         while Instant::now() < capture_deadline {
             let read_deadline = Instant::now() + Duration::from_millis(200);
-            let line = {
+            let frame = {
                 let mut guard = current
                     .lock()
                     .map_err(|_| "persistent RTT state lock poisoned".to_string())?;
@@ -655,27 +752,27 @@ fn icm_capture_calibration_connected_inner(
                     .ok_or_else(|| "RTT disconnected during capture".to_string())?;
                 connection
                     .session
-                    .read_line_until(read_deadline)
+                    .read_binary_frame_until(read_deadline)
                     .map_err(|err| err.to_string())?
             };
 
-            if let Some(line) = line {
-                if samples.len() < 100 || responses.len() < 300 {
-                    responses.push(line.clone());
-                }
+            if let Some(frame) = frame {
                 if let Some(sample) =
-                    parse_icm_csv_sample(&line, capture_start.elapsed().as_secs_f32())
+                    parse_icm_binary_sample(&frame, capture_start.elapsed().as_secs_f32())
                 {
-                    let payload = GyroRealtimeSampleEvent {
-                        timestamp_ms: sample.timestamp_ms,
-                        ax: sample.accel_mps2[0],
-                        ay: sample.accel_mps2[1],
-                        az: sample.accel_mps2[2],
-                        gx: sample.gyro_dps[0],
-                        gy: sample.gyro_dps[1],
-                        gz: sample.gyro_dps[2],
-                    };
-                    let _ = app.emit(GYRO_STREAM_SAMPLE_EVENT, payload);
+                    if should_emit_sample(plot_decimation, &mut sample_emit_counter) {
+                        let payload = GyroRealtimeSampleEvent {
+                            seq: sample.seq,
+                            timestamp_ms: sample.timestamp_ms,
+                            ax: sample.accel_mps2[0],
+                            ay: sample.accel_mps2[1],
+                            az: sample.accel_mps2[2],
+                            gx: sample.gyro_dps[0],
+                            gy: sample.gyro_dps[1],
+                            gz: sample.gyro_dps[2],
+                        };
+                        let _ = app.emit(GYRO_STREAM_SAMPLE_EVENT, payload);
+                    }
                     samples.push(sample);
                 }
             }
@@ -782,8 +879,9 @@ fn start_rtt_drainer(
     let app_handle = app.clone();
 
     let worker = std::thread::spawn(move || {
+        let mut sample_emit_counter = 0u32;
         while !stop_flag_clone.load(Ordering::Relaxed) {
-            let (read_result, had_connection) = {
+            let (read_result, had_connection, plot_decimation) = {
                 let mut guard = match connection.lock() {
                     Ok(guard) => guard,
                     Err(_) => break,
@@ -791,16 +889,24 @@ fn start_rtt_drainer(
 
                 if let Some(conn) = guard.as_mut() {
                     let deadline = Instant::now() + Duration::from_millis(120);
-                    (conn.session.read_line_until(deadline), true)
+                    (
+                        conn.session.read_binary_frame_until(deadline),
+                        true,
+                        conn.plot_decimation.max(1),
+                    )
                 } else {
-                    (Ok(None), false)
+                    (Ok(None), false, 1)
                 }
             };
 
             match read_result {
-                Ok(Some(line)) => {
-                    if let Some(sample) = parse_icm_csv_sample(&line, 0.0) {
+                Ok(Some(frame)) => {
+                    if !should_emit_sample(plot_decimation, &mut sample_emit_counter) {
+                        continue;
+                    }
+                    if let Some(sample) = parse_icm_binary_sample(&frame, 0.0) {
                         let payload = GyroRealtimeSampleEvent {
+                            seq: sample.seq,
                             timestamp_ms: sample.timestamp_ms,
                             ax: sample.accel_mps2[0],
                             ay: sample.accel_mps2[1],
@@ -916,13 +1022,17 @@ fn open_persistent_rtt_connection(
     let backend = CalibrationBackend::new(config);
     let session = backend
         .open_rtt_text_session(
-            request.serial_number.as_deref().map(str::trim).and_then(|value| {
-                if value.is_empty() {
-                    None
-                } else {
-                    Some(value.to_string())
-                }
-            }),
+            request
+                .serial_number
+                .as_deref()
+                .map(str::trim)
+                .and_then(|value| {
+                    if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    }
+                }),
             if request.device_name.trim().is_empty() {
                 "nRF52840_xxAA".to_string()
             } else {
@@ -938,6 +1048,7 @@ fn open_persistent_rtt_connection(
     Ok(PersistentRttConnection {
         session,
         ack_timeout: Duration::from_millis(request.ack_timeout_ms.max(500)),
+        plot_decimation: request.plot_decimation.max(1),
     })
 }
 
@@ -959,6 +1070,43 @@ fn stop_rtt_drainer(drainer: &Arc<Mutex<Option<PersistentRttDrainer>>>) -> Resul
     Ok(())
 }
 
+fn build_imu_setup_commands(
+    imu_model: ImuModel,
+    odr_hz: u32,
+    stream_hz: u32,
+    accel_range_g: u32,
+    gyro_range_dps: u32,
+    low_noise: bool,
+    fifo: bool,
+    fifo_hires: bool,
+    bno_raw: bool,
+    bno_6dof: bool,
+) -> Vec<String> {
+    match imu_model {
+        ImuModel::Icm45686 => vec![
+            "IMU ICM45686".to_string(),
+            "STREAM_FORMAT BIN".to_string(),
+            format!("STREAM_HZ {}", stream_hz.max(1)),
+            format!("ODR {}", odr_hz.max(1)),
+            format!("ACCEL_RANGE {}", accel_range_g),
+            format!("GYRO_RANGE {}", gyro_range_dps),
+            format!("LOW_NOISE {}", if low_noise { 1 } else { 0 }),
+            format!("FIFO {}", if fifo { 1 } else { 0 }),
+            format!("FIFO_HIRES {}", if fifo_hires { 1 } else { 0 }),
+            "APPLY".to_string(),
+        ],
+        ImuModel::Bno086 => vec![
+            "IMU BNO086".to_string(),
+            "STREAM_FORMAT BIN".to_string(),
+            format!("STREAM_HZ {}", stream_hz.max(1)),
+            format!("ODR {}", odr_hz.max(1)),
+            format!("BNO_RAW {}", if bno_raw { 1 } else { 0 }),
+            format!("BNO_6DOF {}", if bno_6dof { 1 } else { 0 }),
+            "APPLY".to_string(),
+        ],
+    }
+}
+
 fn emit_gyro_stream_status(app: &tauri::AppHandle, level: &str, message: impl Into<String>) {
     let payload = GyroRealtimeStatusEvent {
         level: level.to_string(),
@@ -973,6 +1121,17 @@ fn emit_rtt_connection_status(app: &tauri::AppHandle, connected: bool, message: 
         message: message.into(),
     };
     let _ = app.emit(RTT_CONNECTION_STATUS_EVENT, payload);
+}
+
+fn should_emit_sample(decimation: u32, counter: &mut u32) -> bool {
+    let ratio = decimation.max(1);
+    *counter = counter.saturating_add(1);
+    if *counter >= ratio {
+        *counter = 0;
+        true
+    } else {
+        false
+    }
 }
 
 fn is_retryable_connection_io_error(err: &calibration_backend::BackendError) -> bool {
@@ -994,12 +1153,10 @@ fn execute_backend_args(args: Vec<String>) -> Result<Value, String> {
 
     parse_global_options(&mut cursor, &mut config)?;
 
-    let command = cursor
-        .next()
-        .ok_or_else(|| {
-            "missing command (expected tools|probes|flash|rtt-command|icm-capture-cal|icm-write-cal)"
-                .to_string()
-        })?;
+    let command = cursor.next().ok_or_else(|| {
+        "missing command (expected tools|probes|flash|rtt-command|icm-capture-cal|icm-write-cal)"
+            .to_string()
+    })?;
 
     let backend = CalibrationBackend::new(config.clone());
 
@@ -1148,16 +1305,26 @@ fn execute_backend_args(args: Vec<String>) -> Result<Value, String> {
                             parse_bool(&cursor.require_value("--compute-accel")?, flag.as_str())?
                     }
                     "--min-total-samples" => {
-                        request.min_total_samples =
-                            parse_usize(&cursor.require_value("--min-total-samples")?, flag.as_str())?
+                        request.min_total_samples = parse_usize(
+                            &cursor.require_value("--min-total-samples")?,
+                            flag.as_str(),
+                        )?
                     }
                     "--min-gyro-samples" => {
-                        request.min_gyro_samples =
-                            parse_usize(&cursor.require_value("--min-gyro-samples")?, flag.as_str())?
+                        request.min_gyro_samples = parse_usize(
+                            &cursor.require_value("--min-gyro-samples")?,
+                            flag.as_str(),
+                        )?
                     }
                     "--min-accel-points" => {
-                        request.min_accel_points =
-                            parse_usize(&cursor.require_value("--min-accel-points")?, flag.as_str())?
+                        request.min_accel_points = parse_usize(
+                            &cursor.require_value("--min-accel-points")?,
+                            flag.as_str(),
+                        )?
+                    }
+                    "--imu" => {
+                        request.imu_model = ImuModel::from_str(&cursor.require_value("--imu")?)
+                            .map_err(|err| format!("invalid --imu value: {err}"))?
                     }
                     "--odr-hz" => {
                         request.odr_hz =
@@ -1185,6 +1352,14 @@ fn execute_backend_args(args: Vec<String>) -> Result<Value, String> {
                     "--fifo-hires" => {
                         request.fifo_hires =
                             parse_bool(&cursor.require_value("--fifo-hires")?, flag.as_str())?
+                    }
+                    "--bno-raw" => {
+                        request.bno_raw =
+                            parse_bool(&cursor.require_value("--bno-raw")?, flag.as_str())?
+                    }
+                    "--bno-6dof" => {
+                        request.bno_6dof =
+                            parse_bool(&cursor.require_value("--bno-6dof")?, flag.as_str())?
                     }
                     _ => return Err(format!("unknown icm-capture-cal option: {flag}")),
                 }
@@ -1229,6 +1404,10 @@ fn execute_backend_args(args: Vec<String>) -> Result<Value, String> {
                         request.ack_timeout_ms =
                             parse_u64(&cursor.require_value("--ack-timeout-ms")?, flag.as_str())?
                     }
+                    "--imu" => {
+                        request.imu_model = ImuModel::from_str(&cursor.require_value("--imu")?)
+                            .map_err(|err| format!("invalid --imu value: {err}"))?
+                    }
                     "--odr-hz" => {
                         request.odr_hz =
                             parse_u32(&cursor.require_value("--odr-hz")?, flag.as_str())?
@@ -1251,6 +1430,14 @@ fn execute_backend_args(args: Vec<String>) -> Result<Value, String> {
                     "--fifo-hires" => {
                         request.fifo_hires =
                             parse_bool(&cursor.require_value("--fifo-hires")?, flag.as_str())?
+                    }
+                    "--bno-raw" => {
+                        request.bno_raw =
+                            parse_bool(&cursor.require_value("--bno-raw")?, flag.as_str())?
+                    }
+                    "--bno-6dof" => {
+                        request.bno_6dof =
+                            parse_bool(&cursor.require_value("--bno-6dof")?, flag.as_str())?
                     }
                     "--write-gyro-bias" => {
                         request.write_gyro_bias =
@@ -1396,6 +1583,7 @@ fn main() {
             connect_rtt,
             disconnect_rtt,
             rtt_connection_status,
+            set_rtt_plot_decimation,
             rtt_command_connected,
             icm_capture_calibration_connected,
             start_gyro_stream,

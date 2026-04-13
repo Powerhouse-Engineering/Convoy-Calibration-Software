@@ -2,7 +2,7 @@ use crate::types::RttCommandResult;
 use crate::{BackendError, Result};
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -24,9 +24,15 @@ pub struct RttServerConfig {
 
 pub struct RttSession {
     child: Child,
-    reader: BufReader<TcpStream>,
-    writer: TcpStream,
+    socket: TcpStream,
+    read_buf: Vec<u8>,
     script_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RttIncomingMessage {
+    Line(String),
+    BinaryFrame(Vec<u8>),
 }
 
 impl RttSession {
@@ -88,7 +94,7 @@ impl RttSession {
         );
 
         let connect_start = Instant::now();
-        let writer = loop {
+        let socket = loop {
             match TcpStream::connect(addr) {
                 Ok(stream) => break stream,
                 Err(_) => {
@@ -113,17 +119,14 @@ impl RttSession {
             }
         };
 
-        writer.set_nodelay(true)?;
-        writer.set_write_timeout(Some(Duration::from_secs(2)))?;
-
-        let reader_stream = writer.try_clone()?;
-        reader_stream.set_read_timeout(Some(READ_POLL_TIMEOUT))?;
-        let reader = BufReader::new(reader_stream);
+        socket.set_nodelay(true)?;
+        socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+        socket.set_read_timeout(Some(READ_POLL_TIMEOUT))?;
 
         Ok(Self {
             child,
-            reader,
-            writer,
+            socket,
+            read_buf: Vec::with_capacity(4096),
             script_path,
         })
     }
@@ -135,34 +138,44 @@ impl RttSession {
             .copied()
             .chain(std::iter::once(b'\n'))
         {
-            self.writer.write_all(&[byte])?;
-            self.writer.flush()?;
+            self.socket.write_all(&[byte])?;
+            self.socket.flush()?;
             // Some targets use tiny RTT down-buffers; pacing avoids truncating long commands.
             thread::sleep(Duration::from_millis(2));
         }
         Ok(())
     }
 
-    pub fn read_line_until(&mut self, deadline: Instant) -> Result<Option<String>> {
+    pub fn read_message_until(&mut self, deadline: Instant) -> Result<Option<RttIncomingMessage>> {
         loop {
             if Instant::now() > deadline {
                 return Ok(None);
             }
 
-            let mut line = String::new();
-            match self.reader.read_line(&mut line) {
+            if let Some(message) = self.try_parse_message() {
+                return Ok(Some(message));
+            }
+
+            let mut chunk = [0u8; 1024];
+            match self.socket.read(&mut chunk) {
                 Ok(0) => {
+                    if self.read_buf.is_empty() {
+                        return Err(BackendError::Io(std::io::Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "RTT socket closed by peer",
+                        )));
+                    }
+                    // If socket closed with pending bytes, flush what can be parsed before erroring.
+                    if let Some(message) = self.try_parse_message() {
+                        return Ok(Some(message));
+                    }
                     return Err(BackendError::Io(std::io::Error::new(
                         ErrorKind::UnexpectedEof,
                         "RTT socket closed by peer",
                     )));
                 }
-                Ok(_) => {
-                    let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    return Ok(Some(trimmed));
+                Ok(read_len) => {
+                    self.read_buf.extend_from_slice(&chunk[..read_len]);
                 }
                 Err(err)
                     if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut =>
@@ -171,6 +184,93 @@ impl RttSession {
                 }
                 Err(err) => return Err(BackendError::Io(err)),
             }
+        }
+    }
+
+    pub fn read_line_until(&mut self, deadline: Instant) -> Result<Option<String>> {
+        loop {
+            match self.read_message_until(deadline)? {
+                Some(RttIncomingMessage::Line(line)) => return Ok(Some(line)),
+                Some(RttIncomingMessage::BinaryFrame(_)) => continue,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    pub fn read_binary_frame_until(&mut self, deadline: Instant) -> Result<Option<Vec<u8>>> {
+        loop {
+            match self.read_message_until(deadline)? {
+                Some(RttIncomingMessage::BinaryFrame(frame)) => return Ok(Some(frame)),
+                Some(RttIncomingMessage::Line(_)) => continue,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    fn try_parse_message(&mut self) -> Option<RttIncomingMessage> {
+        loop {
+            if self.read_buf.is_empty() {
+                return None;
+            }
+
+            let newline_idx = self.read_buf.iter().position(|byte| *byte == b'\n');
+            let magic_idx = find_binary_magic(&self.read_buf);
+
+            if magic_idx == Some(0) {
+                if self.read_buf.len() < 16 {
+                    return None;
+                }
+
+                let payload_len = u16::from_le_bytes([self.read_buf[6], self.read_buf[7]]) as usize;
+                let total_len = 16usize.saturating_add(payload_len);
+                if payload_len > 256 {
+                    self.read_buf.drain(..1);
+                    continue;
+                }
+                if self.read_buf.len() < total_len {
+                    return None;
+                }
+
+                let frame = self.read_buf.drain(..total_len).collect::<Vec<u8>>();
+                return Some(RttIncomingMessage::BinaryFrame(frame));
+            }
+
+            if let Some(newline_idx) = newline_idx {
+                if magic_idx.map_or(true, |magic| newline_idx < magic) {
+                    let mut line_bytes = self.read_buf.drain(..=newline_idx).collect::<Vec<u8>>();
+                    while matches!(line_bytes.last(), Some(b'\n' | b'\r')) {
+                        line_bytes.pop();
+                    }
+                    let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    return Some(RttIncomingMessage::Line(line));
+                }
+            }
+
+            if let Some(magic_idx) = magic_idx {
+                if magic_idx > 0 {
+                    let prefix = self.read_buf.drain(..magic_idx).collect::<Vec<u8>>();
+                    let line = parse_text_prefix(prefix);
+                    if line.is_empty() {
+                        continue;
+                    }
+                    return Some(RttIncomingMessage::Line(line));
+                }
+            }
+
+            if self.read_buf.len() > 4096 {
+                let prefix_len = self.read_buf.len().min(1024);
+                let prefix = self.read_buf.drain(..prefix_len).collect::<Vec<u8>>();
+                let line = parse_text_prefix(prefix);
+                if line.is_empty() {
+                    continue;
+                }
+                return Some(RttIncomingMessage::Line(line));
+            }
+
+            return None;
         }
     }
 
@@ -193,47 +293,62 @@ impl RttSession {
             let mut lines = Vec::<String>::new();
             let mut first_err_msg: Option<String> = None;
             let mut saw_imu_stream_line = false;
+            let mut saw_binary_stream_frame = false;
 
-            while let Some(line) = self.read_line_until(deadline)? {
-                let line_trimmed = line.trim();
-                let line_sanitized = strip_ansi_sequences(line_trimmed);
-                let line_sanitized_trimmed = line_sanitized.trim();
+            while let Some(message) = self.read_message_until(deadline)? {
+                match message {
+                    RttIncomingMessage::BinaryFrame(_) => {
+                        saw_binary_stream_frame = true;
+                        if command_keyword == "START" {
+                            return Ok(RttCommandResult {
+                                command: command.to_string(),
+                                ack: "STARTED (binary stream active; ACK dropped)".to_string(),
+                                lines,
+                            });
+                        }
+                    }
+                    RttIncomingMessage::Line(line) => {
+                        let line_trimmed = line.trim();
+                        let line_sanitized = strip_ansi_sequences(line_trimmed);
+                        let line_sanitized_trimmed = line_sanitized.trim();
 
-                if line_sanitized_trimmed.starts_with("RTT_IMU,")
-                    || line_sanitized_trimmed.starts_with("RTT_BIN,")
-                {
-                    saw_imu_stream_line = true;
-                    if command_keyword == "START" {
+                        if line_sanitized_trimmed.starts_with("RTT_IMU,")
+                            || line_sanitized_trimmed.starts_with("RTT_BIN,")
+                        {
+                            saw_imu_stream_line = true;
+                            if command_keyword == "START" {
+                                lines.push(line);
+                                return Ok(RttCommandResult {
+                                    command: command.to_string(),
+                                    ack: "STARTED (stream active; ACK dropped)".to_string(),
+                                    lines,
+                                });
+                            }
+                        }
+
+                        if let Some(ack) = parse_ack_ok_line(line_sanitized_trimmed) {
+                            lines.push(line);
+                            return Ok(RttCommandResult {
+                                command: command.to_string(),
+                                ack,
+                                lines,
+                            });
+                        }
+
+                        if let Some(err_msg) = parse_ack_err_line(line_sanitized_trimmed) {
+                            if first_err_msg.is_none() {
+                                first_err_msg = Some(err_msg);
+                            }
+                            lines.push(line);
+                            continue;
+                        }
+
                         lines.push(line);
-                        return Ok(RttCommandResult {
-                            command: command.to_string(),
-                            ack: "STARTED (stream active; ACK dropped)".to_string(),
-                            lines,
-                        });
                     }
                 }
-
-                if let Some(ack) = parse_ack_ok_line(line_sanitized_trimmed) {
-                    lines.push(line);
-                    return Ok(RttCommandResult {
-                        command: command.to_string(),
-                        ack,
-                        lines,
-                    });
-                }
-
-                if let Some(err_msg) = parse_ack_err_line(line_sanitized_trimmed) {
-                    if first_err_msg.is_none() {
-                        first_err_msg = Some(err_msg);
-                    }
-                    lines.push(line);
-                    continue;
-                }
-
-                lines.push(line);
             }
 
-            if command_keyword == "START" && saw_imu_stream_line {
+            if command_keyword == "START" && (saw_imu_stream_line || saw_binary_stream_frame) {
                 return Ok(RttCommandResult {
                     command: command.to_string(),
                     ack: "STARTED (stream active; ACK dropped)".to_string(),
@@ -245,7 +360,9 @@ impl RttSession {
                 final_lines = lines;
                 final_err_msg = Some(err_msg);
                 if attempt + 1 < max_attempts {
-                    if saw_imu_stream_line && should_quiet_stream_before_retry(command_keyword) {
+                    if (saw_imu_stream_line || saw_binary_stream_frame)
+                        && should_quiet_stream_before_retry(command_keyword)
+                    {
                         self.try_stop_stream(ack_timeout.min(Duration::from_millis(900)));
                     }
                     thread::sleep(Duration::from_millis(300));
@@ -255,7 +372,7 @@ impl RttSession {
             }
 
             if attempt + 1 < max_attempts
-                && saw_imu_stream_line
+                && (saw_imu_stream_line || saw_binary_stream_frame)
                 && should_quiet_stream_before_retry(command_keyword)
             {
                 final_lines = lines;
@@ -453,10 +570,20 @@ fn process_exists(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+fn find_binary_magic(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(2).position(|window| window == [0x1B, 0xCA])
+}
+
+fn parse_text_prefix(prefix: Vec<u8>) -> String {
+    String::from_utf8_lossy(&prefix).trim().to_string()
+}
+
 fn parse_ack_ok_line(line: &str) -> Option<String> {
     let ack_marker = "RTT_ACK,OK";
     if let Some(idx) = line.find(ack_marker) {
-        let suffix = line[idx + ack_marker.len()..].trim_start_matches(',').trim();
+        let suffix = line[idx + ack_marker.len()..]
+            .trim_start_matches(',')
+            .trim();
         return Some(if suffix.is_empty() {
             "OK".to_string()
         } else {
@@ -483,7 +610,9 @@ fn parse_ack_ok_line(line: &str) -> Option<String> {
 fn parse_ack_err_line(line: &str) -> Option<String> {
     let err_marker = "RTT_ACK,ERR";
     if let Some(idx) = line.find(err_marker) {
-        let suffix = line[idx + err_marker.len()..].trim_start_matches(',').trim();
+        let suffix = line[idx + err_marker.len()..]
+            .trim_start_matches(',')
+            .trim();
         return Some(if suffix.is_empty() {
             "unknown RTT error".to_string()
         } else {

@@ -1,3 +1,4 @@
+use crate::rtt_protocol::ImuBinaryPayload;
 use crate::types::{IcmCalibrationEstimate, IcmCsvSample};
 use crate::{BackendError, Result};
 use nalgebra::{DMatrix, DVector, Matrix3, Vector3};
@@ -74,9 +75,8 @@ pub fn estimate_gyro_bias_with_min_samples(
 pub fn estimate_accel_ellipsoid(
     samples: &[IcmCsvSample],
 ) -> Result<([f32; 3], [[f32; 3]; 3], f32, f32)> {
-    estimate_accel_ellipsoid_with_min_points(samples, 80).map(
-        |(offset, xform, rms, max, _point_count)| (offset, xform, rms, max),
-    )
+    estimate_accel_ellipsoid_with_min_points(samples, 80)
+        .map(|(offset, xform, rms, max, _point_count)| (offset, xform, rms, max))
 }
 
 pub fn estimate_accel_ellipsoid_with_min_points(
@@ -230,6 +230,58 @@ pub fn ensure_min_total_samples(samples: &[IcmCsvSample], min_total_samples: usi
         )));
     }
     Ok(())
+}
+
+pub fn parse_icm_binary_sample(frame: &[u8], host_elapsed_s: f32) -> Option<IcmCsvSample> {
+    let parsed = crate::rtt_protocol::parse_binary_imu_frame(frame).ok()?;
+    let (
+        sample_count,
+        accel_mps2,
+        gyro_dps,
+        temp_c,
+        temp_valid,
+        accel_accuracy,
+        gyro_accuracy,
+        cal_state,
+    ) = match parsed.payload {
+        ImuBinaryPayload::Icm(payload) => {
+            let temp_valid = (payload.valid_flags & (1u8 << 2)) != 0;
+            (
+                payload.sample_count,
+                payload.accel_mps2,
+                payload.gyro_dps,
+                if temp_valid { payload.temp_c } else { 0.0 },
+                temp_valid,
+                payload.accel_accuracy,
+                payload.gyro_accuracy,
+                payload.cal_state,
+            )
+        }
+        ImuBinaryPayload::Bno(payload) => (
+            parsed.header.seq,
+            payload.accel_mps2,
+            payload.gyro_dps,
+            0.0,
+            false,
+            payload.accel_accuracy,
+            payload.gyro_accuracy,
+            payload.cal_state,
+        ),
+    };
+
+    Some(IcmCsvSample {
+        host_elapsed_s,
+        seq: parsed.header.seq,
+        timestamp_ms: parsed.header.timestamp_ms,
+        sample_count,
+        accel_mps2,
+        gyro_dps,
+        temp_c,
+        temp_valid,
+        accel_accuracy,
+        gyro_accuracy,
+        cal_state,
+    })
 }
 
 pub fn parse_icm_csv_sample(line: &str, host_elapsed_s: f32) -> Option<IcmCsvSample> {
