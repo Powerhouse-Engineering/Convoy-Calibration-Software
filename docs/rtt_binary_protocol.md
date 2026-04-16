@@ -20,7 +20,7 @@ In the current calibration build, binary frames and command/ACK traffic share RT
 | 8 | 4 | `seq` |
 | 12 | 4 | `timestamp_ms` |
 
-## ICM45686 Payload (36 bytes)
+## ICM45686 Payload (48 bytes, current)
 
 Order:
 
@@ -32,12 +32,17 @@ Order:
 6. `gyro_y_dps` (`f32`)
 7. `gyro_z_dps` (`f32`)
 8. `temp_c` (`f32`, NaN if invalid)
-9. `valid_flags` (`u8`, bit0 accel, bit1 gyro, bit2 temp)
-10. `accel_accuracy` (`u8`)
-11. `gyro_accuracy` (`u8`)
-12. `cal_state` (`u8`)
+9. `gravity_x_mps2` (`f32`, NaN if invalid)
+10. `gravity_y_mps2` (`f32`, NaN if invalid)
+11. `gravity_z_mps2` (`f32`, NaN if invalid)
+12. `valid_flags` (`u8`, bit0 accel, bit1 gyro, bit2 temp, bit3 gravity)
+13. `accel_accuracy` (`u8`)
+14. `gyro_accuracy` (`u8`)
+15. `cal_state` (`u8`)
 
-## BNO086 Payload (45 bytes)
+Legacy ICM payload length `36` (without gravity fields) is still accepted by the host parser.
+
+## BNO086 Payload (57 bytes, current)
 
 Order:
 
@@ -51,8 +56,13 @@ Order:
 8. `quat_x` (`f32`)
 9. `quat_y` (`f32`)
 10. `quat_z` (`f32`)
-11. `valid_flags` (`u8`, bit0 accel, bit1 gyro, bit2 quat)
-12. `accel_accuracy` (`u8`)
-13. `gyro_accuracy` (`u8`)
-14. `mag_accuracy` (`u8`)
-15. `cal_state` (`u8`)
+11. `gravity_x_mps2` (`f32`, NaN if invalid)
+12. `gravity_y_mps2` (`f32`, NaN if invalid)
+13. `gravity_z_mps2` (`f32`, NaN if invalid)
+14. `valid_flags` (`u8`, bit0 accel, bit1 gyro, bit2 quat, bit3 gravity)
+15. `accel_accuracy` (`u8`)
+16. `gyro_accuracy` (`u8`)
+17. `mag_accuracy` (`u8`)
+18. `cal_state` (`u8`)
+
+Legacy BNO payload length `45` (without gravity fields) is still accepted by the host parser.

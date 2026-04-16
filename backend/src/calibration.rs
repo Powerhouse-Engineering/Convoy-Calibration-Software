@@ -4,6 +4,7 @@ use crate::{BackendError, Result};
 use nalgebra::{DMatrix, DVector, Matrix3, Vector3};
 
 const GRAVITY_MPS2: f64 = 9.80665;
+const LINEAR_ACCEL_REJECT_THRESHOLD_MPS2: f64 = 2.0;
 
 pub fn estimate_icm_calibration(
     samples: &[IcmCsvSample],
@@ -83,29 +84,43 @@ pub fn estimate_accel_ellipsoid_with_min_points(
     samples: &[IcmCsvSample],
     min_points: usize,
 ) -> Result<([f32; 3], [[f32; 3]; 3], f32, f32, usize)> {
+    let has_gravity_reference = samples
+        .iter()
+        .any(|sample| gravity_vector_if_valid(sample).is_some());
+
     let accel_points = samples
         .iter()
         .filter_map(|sample| {
-            let point = [
-                f64::from(sample.accel_mps2[0]),
-                f64::from(sample.accel_mps2[1]),
-                f64::from(sample.accel_mps2[2]),
-            ];
-
-            if point.iter().all(|value| value.is_finite()) {
-                Some(point)
-            } else {
-                None
+            let point = finite_vec3(sample.accel_mps2)?;
+            if has_gravity_reference {
+                let gravity = gravity_vector_if_valid(sample)?;
+                let linear_accel_mps2 = vector_distance(point, gravity);
+                if !linear_accel_mps2.is_finite()
+                    || linear_accel_mps2 > LINEAR_ACCEL_REJECT_THRESHOLD_MPS2
+                {
+                    return None;
+                }
             }
+            Some(point)
         })
         .collect::<Vec<[f64; 3]>>();
 
     if accel_points.len() < min_points {
-        return Err(BackendError::InvalidInput(format!(
-            "not enough accel points for ellipsoid fit ({} found, need at least {})",
-            accel_points.len(),
-            min_points
-        )));
+        let reason = if has_gravity_reference {
+            format!(
+                "not enough accel points for ellipsoid fit after gravity linear-accel rejection ({} found, need at least {}, threshold={} m/s^2)",
+                accel_points.len(),
+                min_points,
+                LINEAR_ACCEL_REJECT_THRESHOLD_MPS2
+            )
+        } else {
+            format!(
+                "not enough accel points for ellipsoid fit ({} found, need at least {})",
+                accel_points.len(),
+                min_points
+            )
+        };
+        return Err(BackendError::InvalidInput(reason));
     }
 
     let rows = accel_points.len();
@@ -232,11 +247,40 @@ pub fn ensure_min_total_samples(samples: &[IcmCsvSample], min_total_samples: usi
     Ok(())
 }
 
+fn finite_vec3(values: [f32; 3]) -> Option<[f64; 3]> {
+    let point = [
+        f64::from(values[0]),
+        f64::from(values[1]),
+        f64::from(values[2]),
+    ];
+    if point.iter().all(|value| value.is_finite()) {
+        Some(point)
+    } else {
+        None
+    }
+}
+
+fn gravity_vector_if_valid(sample: &IcmCsvSample) -> Option<[f64; 3]> {
+    if !sample.gravity_valid {
+        return None;
+    }
+    finite_vec3(sample.gravity_mps2)
+}
+
+fn vector_distance(lhs: [f64; 3], rhs: [f64; 3]) -> f64 {
+    let dx = lhs[0] - rhs[0];
+    let dy = lhs[1] - rhs[1];
+    let dz = lhs[2] - rhs[2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
 pub fn parse_icm_binary_sample(frame: &[u8], host_elapsed_s: f32) -> Option<IcmCsvSample> {
     let parsed = crate::rtt_protocol::parse_binary_imu_frame(frame).ok()?;
     let (
         sample_count,
         accel_mps2,
+        gravity_mps2,
+        gravity_valid,
         gyro_dps,
         temp_c,
         temp_valid,
@@ -246,9 +290,16 @@ pub fn parse_icm_binary_sample(frame: &[u8], host_elapsed_s: f32) -> Option<IcmC
     ) = match parsed.payload {
         ImuBinaryPayload::Icm(payload) => {
             let temp_valid = (payload.valid_flags & (1u8 << 2)) != 0;
+            let gravity_valid = (payload.valid_flags & (1u8 << 3)) != 0;
             (
                 payload.sample_count,
                 payload.accel_mps2,
+                if gravity_valid {
+                    payload.gravity_mps2
+                } else {
+                    [0.0, 0.0, 0.0]
+                },
+                gravity_valid,
                 payload.gyro_dps,
                 if temp_valid { payload.temp_c } else { 0.0 },
                 temp_valid,
@@ -257,16 +308,25 @@ pub fn parse_icm_binary_sample(frame: &[u8], host_elapsed_s: f32) -> Option<IcmC
                 payload.cal_state,
             )
         }
-        ImuBinaryPayload::Bno(payload) => (
-            parsed.header.seq,
-            payload.accel_mps2,
-            payload.gyro_dps,
-            0.0,
-            false,
-            payload.accel_accuracy,
-            payload.gyro_accuracy,
-            payload.cal_state,
-        ),
+        ImuBinaryPayload::Bno(payload) => {
+            let gravity_valid = (payload.valid_flags & (1u8 << 3)) != 0;
+            (
+                parsed.header.seq,
+                payload.accel_mps2,
+                if gravity_valid {
+                    payload.gravity_mps2
+                } else {
+                    [0.0, 0.0, 0.0]
+                },
+                gravity_valid,
+                payload.gyro_dps,
+                0.0,
+                false,
+                payload.accel_accuracy,
+                payload.gyro_accuracy,
+                payload.cal_state,
+            )
+        }
     };
 
     Some(IcmCsvSample {
@@ -275,6 +335,8 @@ pub fn parse_icm_binary_sample(frame: &[u8], host_elapsed_s: f32) -> Option<IcmC
         timestamp_ms: parsed.header.timestamp_ms,
         sample_count,
         accel_mps2,
+        gravity_mps2,
+        gravity_valid,
         gyro_dps,
         temp_c,
         temp_valid,
@@ -314,6 +376,8 @@ pub fn parse_icm_csv_sample(line: &str, host_elapsed_s: f32) -> Option<IcmCsvSam
             parse_f32(fields[6])?,
             parse_f32(fields[7])?,
         ],
+        gravity_mps2: [0.0, 0.0, 0.0],
+        gravity_valid: false,
         gyro_dps: [
             parse_f32(fields[8])?,
             parse_f32(fields[9])?,

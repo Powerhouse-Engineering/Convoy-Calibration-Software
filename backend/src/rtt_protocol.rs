@@ -6,8 +6,10 @@ pub const RTT_BIN_MAGIC: u16 = 0xCA1B;
 pub const RTT_BIN_VERSION: u8 = 1;
 pub const RTT_BIN_FRAME_IMU: u8 = 1;
 pub const RTT_BIN_HEADER_LEN: usize = 16;
-pub const RTT_BIN_ICM_PAYLOAD_LEN: usize = 36;
-pub const RTT_BIN_BNO_PAYLOAD_LEN: usize = 45;
+pub const RTT_BIN_ICM_PAYLOAD_LEN: usize = 48;
+pub const RTT_BIN_ICM_PAYLOAD_LEN_LEGACY: usize = 36;
+pub const RTT_BIN_BNO_PAYLOAD_LEN: usize = 57;
+pub const RTT_BIN_BNO_PAYLOAD_LEN_LEGACY: usize = 45;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RttBinaryHeader {
@@ -27,6 +29,7 @@ pub struct IcmBinaryPayload {
     pub accel_mps2: [f32; 3],
     pub gyro_dps: [f32; 3],
     pub temp_c: f32,
+    pub gravity_mps2: [f32; 3],
     pub valid_flags: u8,
     pub accel_accuracy: u8,
     pub gyro_accuracy: u8,
@@ -38,6 +41,7 @@ pub struct BnoBinaryPayload {
     pub accel_mps2: [f32; 3],
     pub gyro_dps: [f32; 3],
     pub quat: [f32; 4],
+    pub gravity_mps2: [f32; 3],
     pub valid_flags: u8,
     pub accel_accuracy: u8,
     pub gyro_accuracy: u8,
@@ -132,7 +136,32 @@ pub fn parse_binary_imu_frame(frame: &[u8]) -> Result<ImuBinaryFrame> {
 }
 
 fn parse_icm_payload(payload: &[u8]) -> Result<IcmBinaryPayload> {
-    if payload.len() != RTT_BIN_ICM_PAYLOAD_LEN {
+    let (gravity_offset, flags_offset) = match payload.len() {
+        RTT_BIN_ICM_PAYLOAD_LEN => (Some(32usize), 44usize),
+        RTT_BIN_ICM_PAYLOAD_LEN_LEGACY => (None, 32usize),
+        _ => {
+            return Err(BackendError::InvalidInput(format!(
+                "invalid ICM payload length: {}",
+                payload.len()
+            )))
+        }
+    };
+
+    let gravity_mps2 = if let Some(offset) = gravity_offset {
+        [
+            read_f32_le(payload, offset)?,
+            read_f32_le(payload, offset + 4)?,
+            read_f32_le(payload, offset + 8)?,
+        ]
+    } else {
+        [f32::NAN, f32::NAN, f32::NAN]
+    };
+
+    let accel_accuracy_offset = flags_offset + 1;
+    let gyro_accuracy_offset = flags_offset + 2;
+    let cal_state_offset = flags_offset + 3;
+
+    if cal_state_offset >= payload.len() {
         return Err(BackendError::InvalidInput(format!(
             "invalid ICM payload length: {}",
             payload.len()
@@ -152,15 +181,42 @@ fn parse_icm_payload(payload: &[u8]) -> Result<IcmBinaryPayload> {
             read_f32_le(payload, 24)?,
         ],
         temp_c: read_f32_le(payload, 28)?,
-        valid_flags: payload[32],
-        accel_accuracy: payload[33],
-        gyro_accuracy: payload[34],
-        cal_state: payload[35],
+        gravity_mps2,
+        valid_flags: payload[flags_offset],
+        accel_accuracy: payload[accel_accuracy_offset],
+        gyro_accuracy: payload[gyro_accuracy_offset],
+        cal_state: payload[cal_state_offset],
     })
 }
 
 fn parse_bno_payload(payload: &[u8]) -> Result<BnoBinaryPayload> {
-    if payload.len() != RTT_BIN_BNO_PAYLOAD_LEN {
+    let (gravity_offset, flags_offset) = match payload.len() {
+        RTT_BIN_BNO_PAYLOAD_LEN => (Some(40usize), 52usize),
+        RTT_BIN_BNO_PAYLOAD_LEN_LEGACY => (None, 40usize),
+        _ => {
+            return Err(BackendError::InvalidInput(format!(
+                "invalid BNO payload length: {}",
+                payload.len()
+            )))
+        }
+    };
+
+    let gravity_mps2 = if let Some(offset) = gravity_offset {
+        [
+            read_f32_le(payload, offset)?,
+            read_f32_le(payload, offset + 4)?,
+            read_f32_le(payload, offset + 8)?,
+        ]
+    } else {
+        [f32::NAN, f32::NAN, f32::NAN]
+    };
+
+    let accel_accuracy_offset = flags_offset + 1;
+    let gyro_accuracy_offset = flags_offset + 2;
+    let mag_accuracy_offset = flags_offset + 3;
+    let cal_state_offset = flags_offset + 4;
+
+    if cal_state_offset >= payload.len() {
         return Err(BackendError::InvalidInput(format!(
             "invalid BNO payload length: {}",
             payload.len()
@@ -184,11 +240,12 @@ fn parse_bno_payload(payload: &[u8]) -> Result<BnoBinaryPayload> {
             read_f32_le(payload, 32)?,
             read_f32_le(payload, 36)?,
         ],
-        valid_flags: payload[40],
-        accel_accuracy: payload[41],
-        gyro_accuracy: payload[42],
-        mag_accuracy: payload[43],
-        cal_state: payload[44],
+        gravity_mps2,
+        valid_flags: payload[flags_offset],
+        accel_accuracy: payload[accel_accuracy_offset],
+        gyro_accuracy: payload[gyro_accuracy_offset],
+        mag_accuracy: payload[mag_accuracy_offset],
+        cal_state: payload[cal_state_offset],
     })
 }
 
@@ -243,7 +300,10 @@ mod tests {
         frame.extend_from_slice(&(5.0f32).to_le_bytes());
         frame.extend_from_slice(&(6.0f32).to_le_bytes());
         frame.extend_from_slice(&(25.0f32).to_le_bytes());
-        frame.push(0b0000_0111);
+        frame.extend_from_slice(&(7.0f32).to_le_bytes());
+        frame.extend_from_slice(&(8.0f32).to_le_bytes());
+        frame.extend_from_slice(&(9.0f32).to_le_bytes());
+        frame.push(0b0000_1111);
         frame.push(3);
         frame.push(2);
         frame.push(4);
@@ -257,10 +317,52 @@ mod tests {
                 assert_eq!(payload.sample_count, 10);
                 assert_eq!(payload.accel_mps2, [1.0, 2.0, 3.0]);
                 assert_eq!(payload.gyro_dps, [4.0, 5.0, 6.0]);
-                assert_eq!(payload.valid_flags, 0b0000_0111);
+                assert_eq!(payload.gravity_mps2, [7.0, 8.0, 9.0]);
+                assert_eq!(payload.valid_flags, 0b0000_1111);
                 assert_eq!(payload.accel_accuracy, 3);
                 assert_eq!(payload.gyro_accuracy, 2);
                 assert_eq!(payload.cal_state, 4);
+            }
+            ImuBinaryPayload::Bno(_) => panic!("unexpected payload type"),
+        }
+    }
+
+    #[test]
+    fn parse_legacy_icm_frame_success() {
+        let mut frame = Vec::<u8>::new();
+        frame.extend_from_slice(&RTT_BIN_MAGIC.to_le_bytes());
+        frame.push(RTT_BIN_VERSION);
+        frame.push(RTT_BIN_FRAME_IMU);
+        frame.push(0); // model ICM
+        frame.push(0); // header flags
+        frame.extend_from_slice(&(RTT_BIN_ICM_PAYLOAD_LEN_LEGACY as u16).to_le_bytes());
+        frame.extend_from_slice(&(9u32).to_le_bytes());
+        frame.extend_from_slice(&(4321u32).to_le_bytes());
+
+        frame.extend_from_slice(&(17u32).to_le_bytes());
+        frame.extend_from_slice(&(1.0f32).to_le_bytes());
+        frame.extend_from_slice(&(2.0f32).to_le_bytes());
+        frame.extend_from_slice(&(3.0f32).to_le_bytes());
+        frame.extend_from_slice(&(4.0f32).to_le_bytes());
+        frame.extend_from_slice(&(5.0f32).to_le_bytes());
+        frame.extend_from_slice(&(6.0f32).to_le_bytes());
+        frame.extend_from_slice(&(24.0f32).to_le_bytes());
+        frame.push(0b0000_0111);
+        frame.push(3);
+        frame.push(2);
+        frame.push(4);
+
+        let parsed = parse_binary_imu_frame(&frame).expect("legacy frame should parse");
+        assert_eq!(parsed.header.seq, 9);
+        assert_eq!(parsed.header.timestamp_ms, 4321);
+
+        match parsed.payload {
+            ImuBinaryPayload::Icm(payload) => {
+                assert_eq!(payload.sample_count, 17);
+                assert_eq!(payload.accel_mps2, [1.0, 2.0, 3.0]);
+                assert_eq!(payload.gyro_dps, [4.0, 5.0, 6.0]);
+                assert!(payload.gravity_mps2.iter().all(|value| value.is_nan()));
+                assert_eq!(payload.valid_flags, 0b0000_0111);
             }
             ImuBinaryPayload::Bno(_) => panic!("unexpected payload type"),
         }

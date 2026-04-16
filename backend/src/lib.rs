@@ -11,8 +11,9 @@ pub use backend::CalibrationBackend;
 pub use config::BackendConfig;
 pub use rtt_protocol::{
     parse_binary_imu_frame, BnoBinaryPayload, IcmBinaryPayload, ImuBinaryFrame, ImuBinaryPayload,
-    RttBinaryHeader, RTT_BIN_BNO_PAYLOAD_LEN, RTT_BIN_FRAME_IMU, RTT_BIN_HEADER_LEN,
-    RTT_BIN_ICM_PAYLOAD_LEN, RTT_BIN_MAGIC, RTT_BIN_VERSION,
+    RttBinaryHeader, RTT_BIN_BNO_PAYLOAD_LEN, RTT_BIN_BNO_PAYLOAD_LEN_LEGACY, RTT_BIN_FRAME_IMU,
+    RTT_BIN_HEADER_LEN, RTT_BIN_ICM_PAYLOAD_LEN, RTT_BIN_ICM_PAYLOAD_LEN_LEGACY, RTT_BIN_MAGIC,
+    RTT_BIN_VERSION,
 };
 pub use types::{
     BoardTarget, BuildRequest, BuildResult, EraseStrategy, FlashRequest, FlashResult,

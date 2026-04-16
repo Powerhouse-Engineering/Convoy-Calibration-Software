@@ -186,6 +186,8 @@ pub struct IcmCsvSample {
     pub timestamp_ms: u32,
     pub sample_count: u32,
     pub accel_mps2: [f32; 3],
+    pub gravity_mps2: [f32; 3],
+    pub gravity_valid: bool,
     pub gyro_dps: [f32; 3],
     pub temp_c: f32,
     pub temp_valid: bool,
