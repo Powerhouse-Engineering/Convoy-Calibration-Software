@@ -1,7 +1,9 @@
 import { FormEvent, MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   captureIcmCalibrationConnected,
+  captureIcmSamplesConnected,
   callBackend,
+  computeIcmAccelFromSamples,
   connectRttSession,
   disconnectRttSession,
   getRttConnectionStatus,
@@ -11,6 +13,7 @@ import {
   setRttPlotDecimation,
   sendConnectedRttCommands,
   type GyroRealtimeSampleEvent,
+  type IcmCapturedSample,
   type GyroRealtimeStatusEvent,
   type RttConnectionStatusEvent,
 } from "./backendClient";
@@ -53,6 +56,16 @@ type IcmCaptureCalibrationResult = {
   responses: string[];
 };
 
+type IcmCaptureSamplesResult = {
+  sample_count: number;
+  samples: IcmCapturedSample[];
+  responses: string[];
+};
+
+type IcmComputeAccelFromSamplesResult = {
+  estimate: IcmCalibrationEstimate;
+};
+
 type GyroPlotPoint = {
   t: number;
   gx: number;
@@ -75,6 +88,11 @@ type RuntimeParamCommand = {
   key: string;
   value: string;
   command: string;
+};
+
+type GuidedAccelDirection = {
+  key: string;
+  label: string;
 };
 
 type RuntimeApplySnapshot = {
@@ -152,6 +170,14 @@ const PLOT_LOW_RATE_NO_DECIMATION_THRESHOLD_HZ = 80;
 const PLOT_HIGH_RATE_TARGET_EVENT_HZ = 80;
 const PLOT_TARGET_UPDATES_PER_SECOND = 30;
 const PLOT_MAX_FRAME_DT_S = 0.1;
+const GUIDED_ACCEL_DIRECTIONS: GuidedAccelDirection[] = [
+  { key: "plus_x", label: "+X up" },
+  { key: "minus_x", label: "-X up" },
+  { key: "plus_y", label: "+Y up" },
+  { key: "minus_y", label: "-Y up" },
+  { key: "plus_z", label: "+Z up" },
+  { key: "minus_z", label: "-Z up" },
+];
 
 function toTimestamp(): string {
   return new Date().toISOString().replace("T", " ").replace("Z", "");
@@ -168,6 +194,64 @@ function isIcmCaptureResult(value: unknown): value is IcmCaptureCalibrationResul
     typeof maybe.computed_gyro === "boolean" &&
     typeof maybe.computed_accel === "boolean"
   );
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isVec3(value: unknown): value is [number, number, number] {
+  return (
+    Array.isArray(value) &&
+    value.length === 3 &&
+    value.every((entry) => isFiniteNumber(entry))
+  );
+}
+
+function isIcmCapturedSample(value: unknown): value is IcmCapturedSample {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const maybe = value as Partial<IcmCapturedSample>;
+  return (
+    isFiniteNumber(maybe.host_elapsed_s) &&
+    isFiniteNumber(maybe.seq) &&
+    isFiniteNumber(maybe.timestamp_ms) &&
+    isFiniteNumber(maybe.sample_count) &&
+    isVec3(maybe.accel_mps2) &&
+    isVec3(maybe.gravity_mps2) &&
+    typeof maybe.gravity_valid === "boolean" &&
+    isVec3(maybe.gyro_dps) &&
+    isFiniteNumber(maybe.temp_c) &&
+    typeof maybe.temp_valid === "boolean" &&
+    isFiniteNumber(maybe.accel_accuracy) &&
+    isFiniteNumber(maybe.gyro_accuracy) &&
+    isFiniteNumber(maybe.cal_state)
+  );
+}
+
+function isIcmCaptureSamplesResult(value: unknown): value is IcmCaptureSamplesResult {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const maybe = value as Partial<IcmCaptureSamplesResult>;
+  return (
+    isFiniteNumber(maybe.sample_count) &&
+    Array.isArray(maybe.samples) &&
+    maybe.samples.every((entry) => isIcmCapturedSample(entry))
+  );
+}
+
+function isIcmComputeAccelFromSamplesResult(
+  value: unknown,
+): value is IcmComputeAccelFromSamplesResult {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const maybe = value as Partial<IcmComputeAccelFromSamplesResult>;
+  return !!maybe.estimate;
 }
 
 function encodeBool(value: boolean): string {
@@ -266,6 +350,10 @@ export default function App() {
   const [minTotalSamples, setMinTotalSamples] = useState("80");
   const [minGyroSamples, setMinGyroSamples] = useState("20");
   const [minAccelPoints, setMinAccelPoints] = useState("80");
+  const [guidedAccelSamplesPerFace, setGuidedAccelSamplesPerFace] = useState("200");
+  const [guidedAccelActive, setGuidedAccelActive] = useState(false);
+  const [guidedAccelFaceIndex, setGuidedAccelFaceIndex] = useState(0);
+  const [guidedAccelCollectedSamples, setGuidedAccelCollectedSamples] = useState(0);
   const [writeGyroBias, setWriteGyroBias] = useState(true);
   const [writeAccel, setWriteAccel] = useState(true);
   const [gyroRealtimePlotEnabled, setGyroRealtimePlotEnabled] = useState(false);
@@ -358,6 +446,7 @@ export default function App() {
     ay: null,
     az: null,
   });
+  const guidedAccelSamplesRef = useRef<IcmCapturedSample[]>([]);
   const lastAppliedRuntimeRef = useRef<RuntimeApplySnapshot | null>(null);
 
   useEffect(() => {
@@ -807,7 +896,7 @@ export default function App() {
   }
 
   function commandRequiresExclusiveRttOwnership(command: string | null): boolean {
-    return command === "icm-capture-cal" || command === "icm-write-cal";
+    return command === "icm-capture-cal" || command === "icm-write-cal" || command === "flash";
   }
 
   async function ensureSessionStateForBackendCommand(args: string[]) {
@@ -823,11 +912,11 @@ export default function App() {
       setRttConnected(true);
       setRuntimeStreamRunning(false);
       await syncRttPlotDecimation(currentEffectivePlotDecimationRatio(), true);
-      pushLog("info", "RTT reconnected after exclusive calibration command");
+      pushLog("info", "RTT reconnected after exclusive backend command");
     } catch (error) {
       setRttConnected(false);
       const message = error instanceof Error ? error.message : String(error);
-      pushLog("error", `failed to reconnect RTT after calibration command: ${message}`);
+      pushLog("error", `failed to reconnect RTT after backend command: ${message}`);
     }
   }
 
@@ -1966,6 +2055,126 @@ export default function App() {
     }
   }
 
+  function resetGuidedAccelFlow() {
+    guidedAccelSamplesRef.current = [];
+    setGuidedAccelActive(false);
+    setGuidedAccelFaceIndex(0);
+    setGuidedAccelCollectedSamples(0);
+  }
+
+  async function onStartGuidedAccelCalibration() {
+    if (!rttConnected) {
+      pushLog("error", "RTT is not connected. Use Connect first.");
+      return;
+    }
+
+    guidedAccelSamplesRef.current = [];
+    setGuidedAccelCollectedSamples(0);
+    setGuidedAccelFaceIndex(0);
+    setGuidedAccelActive(true);
+    const first = GUIDED_ACCEL_DIRECTIONS[0];
+    if (first) {
+      pushLog("info", `Guided accel calibration started. Place IMU with ${first.label} and press Continue.`);
+    }
+  }
+
+  async function onCaptureGuidedAccelFace() {
+    if (!guidedAccelActive) {
+      return;
+    }
+    if (!rttConnected) {
+      pushLog("error", "RTT is not connected. Use Connect first.");
+      return;
+    }
+
+    const direction = GUIDED_ACCEL_DIRECTIONS[guidedAccelFaceIndex];
+    if (!direction) {
+      pushLog("error", "invalid guided accel direction index");
+      resetGuidedAccelFlow();
+      return;
+    }
+
+    const targetSamples = parsePositiveIntOr(guidedAccelSamplesPerFace, 200);
+    pushLog(
+      "info",
+      `Capturing ${targetSamples} samples for face ${guidedAccelFaceIndex + 1}/${GUIDED_ACCEL_DIRECTIONS.length} (${direction.label})`,
+    );
+    setBusy(true);
+    try {
+      const output = await captureIcmSamplesConnected({
+        imu_model: imu,
+        ack_timeout_ms: parsePositiveIntOr(ackTimeoutMs, 2000),
+        odr_hz: parsePositiveIntOr(odrHz, 200),
+        stream_hz: parsePositiveIntOr(streamHz, 200),
+        accel_range_g: parsePositiveIntOr(accelRangeG, 16),
+        gyro_range_dps: parsePositiveIntOr(gyroRangeDps, 2000),
+        low_noise: lowNoise,
+        fifo,
+        fifo_hires: fifoHires,
+        bno_raw: imu === "bno086" ? true : bnoRaw,
+        bno_6dof: bno6dof,
+        target_samples: targetSamples,
+        keep_stream_running: false,
+        plot_decimation: currentEffectivePlotDecimationRatio(),
+      });
+
+      if (!isIcmCaptureSamplesResult(output)) {
+        throw new Error("invalid sample-capture response from backend");
+      }
+
+      guidedAccelSamplesRef.current.push(...output.samples);
+      const totalCollected = guidedAccelSamplesRef.current.length;
+      setGuidedAccelCollectedSamples(totalCollected);
+      setRuntimeStreamRunning(false);
+
+      const nextFace = guidedAccelFaceIndex + 1;
+      if (nextFace < GUIDED_ACCEL_DIRECTIONS.length) {
+        setGuidedAccelFaceIndex(nextFace);
+        pushLog(
+          "info",
+          `Face ${guidedAccelFaceIndex + 1}/${GUIDED_ACCEL_DIRECTIONS.length} captured (${output.sample_count} samples). Place IMU with ${GUIDED_ACCEL_DIRECTIONS[nextFace].label} and press Continue.`,
+        );
+        return;
+      }
+
+      pushLog("info", `All 6 faces captured (${totalCollected} samples). Computing accel calibration...`);
+      const computeOutput = await computeIcmAccelFromSamples({
+        samples: guidedAccelSamplesRef.current,
+        min_accel_points: parsePositiveIntOr(minAccelPoints, 80),
+      });
+
+      if (!isIcmComputeAccelFromSamplesResult(computeOutput)) {
+        throw new Error("invalid accel-compute response from backend");
+      }
+
+      const base = lastEstimate ?? createDefaultEstimate();
+      const merged: IcmCalibrationEstimate = {
+        ...base,
+        sample_count: computeOutput.estimate.sample_count,
+        accel_offset_mps2: computeOutput.estimate.accel_offset_mps2,
+        accel_xform: computeOutput.estimate.accel_xform,
+        residual_rms_mps2: computeOutput.estimate.residual_rms_mps2,
+        residual_max_mps2: computeOutput.estimate.residual_max_mps2,
+      };
+      setLastEstimate(merged);
+      setHasAccelEstimate(true);
+      pushLog(
+        "info",
+        `Accel calibration computed. samples=${computeOutput.estimate.sample_count}, rms=${computeOutput.estimate.residual_rms_mps2.toFixed(5)}, max=${computeOutput.estimate.residual_max_mps2.toFixed(5)}`,
+      );
+      resetGuidedAccelFlow();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (shouldMarkDisconnectedAfterCommandError(message)) {
+        setRttConnected(false);
+        setRuntimeStreamRunning(false);
+      }
+      pushLog("error", message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function onCaptureIcmCalibration(computeGyro: boolean, computeAccel: boolean) {
     if (!computeGyro && !computeAccel) {
       pushLog("error", "select at least one calculation mode (gyro or accel)");
@@ -1977,8 +2186,13 @@ export default function App() {
       return;
     }
 
-    const keepStreamRunningDuringAndAfterCapture =
-      runtimeStreamRunning || gyroRealtimePlotRunning || accelRealtimePlotRunning;
+    // Plot listeners can run without an active firmware stream, so only preserve
+    // stream state when runtime stream is actually running.
+    const keepStreamRunningDuringAndAfterCapture = runtimeStreamRunning;
+    pushLog(
+      "info",
+      `Starting capture (${(Number.parseFloat(captureSeconds.trim()) || 30).toFixed(1)} s, keep_stream_running=${keepStreamRunningDuringAndAfterCapture ? "1" : "0"})`,
+    );
     setBusy(true);
     let output: unknown | null = null;
     try {
@@ -2690,21 +2904,16 @@ export default function App() {
     return (
       <div className="tab-content-block">
         <h2 className="section-title">Accelerometer Calibration</h2>
+        <p className="info-note">
+          Guided workflow: place IMU in each of the 6 faces, press Continue for each face, then fit.
+        </p>
         <div className="grid grid-2">
           <label>
-            Capture Duration (s)
+            Samples Per Face
             <input
               type="number"
-              value={captureSeconds}
-              onChange={(event) => setCaptureSeconds(event.target.value)}
-            />
-          </label>
-          <label>
-            Min Total Samples
-            <input
-              type="number"
-              value={minTotalSamples}
-              onChange={(event) => setMinTotalSamples(event.target.value)}
+              value={guidedAccelSamplesPerFace}
+              onChange={(event) => setGuidedAccelSamplesPerFace(event.target.value)}
             />
           </label>
           <label>
@@ -2717,11 +2926,35 @@ export default function App() {
           </label>
         </div>
 
-        <div className="action-row">
-          <button disabled={busy} onClick={() => onCaptureIcmCalibration(false, true)}>
-            Capture + Compute Accel
-          </button>
+        <div className="info-note">
+          Sequence: {GUIDED_ACCEL_DIRECTIONS.map((direction) => direction.label).join(" -> ")}
         </div>
+
+        {guidedAccelActive ? (
+          <>
+            <div className="info-note">
+              Current face: <strong>{guidedAccelFaceIndex + 1}/{GUIDED_ACCEL_DIRECTIONS.length}</strong>{" "}
+              ({GUIDED_ACCEL_DIRECTIONS[guidedAccelFaceIndex]?.label ?? "n/a"})
+            </div>
+            <div className="info-note">
+              Collected samples: <strong>{guidedAccelCollectedSamples}</strong>
+            </div>
+            <div className="action-row">
+              <button disabled={busy} onClick={onCaptureGuidedAccelFace}>
+                Continue (Capture Face)
+              </button>
+              <button disabled={busy} onClick={resetGuidedAccelFlow}>
+                Cancel Guided Capture
+              </button>
+            </div>
+          </>
+        ) : (
+          <div className="action-row">
+            <button disabled={busy || !rttConnected} onClick={onStartGuidedAccelCalibration}>
+              Start Guided Accel Calibration
+            </button>
+          </div>
+        )}
 
         <label className="checkbox-inline">
           <input

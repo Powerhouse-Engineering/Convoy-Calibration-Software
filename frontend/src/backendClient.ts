@@ -99,6 +99,50 @@ export type IcmConnectedCaptureRequest = {
   plot_decimation: number;
 };
 
+export type IcmCaptureSamplesConnectedRequest = {
+  imu_model: "icm45686" | "bno086";
+  ack_timeout_ms: number;
+  odr_hz: number;
+  stream_hz: number;
+  accel_range_g: number;
+  gyro_range_dps: number;
+  low_noise: boolean;
+  fifo: boolean;
+  fifo_hires: boolean;
+  bno_raw: boolean;
+  bno_6dof: boolean;
+  target_samples: number;
+  keep_stream_running: boolean;
+  plot_decimation: number;
+};
+
+export type IcmCapturedSample = {
+  host_elapsed_s: number;
+  seq: number;
+  timestamp_ms: number;
+  sample_count: number;
+  accel_mps2: [number, number, number];
+  gravity_mps2: [number, number, number];
+  gravity_valid: boolean;
+  gyro_dps: [number, number, number];
+  temp_c: number;
+  temp_valid: boolean;
+  accel_accuracy: number;
+  gyro_accuracy: number;
+  cal_state: number;
+};
+
+export type IcmCaptureSamplesConnectedResult = {
+  sample_count: number;
+  samples: IcmCapturedSample[];
+  responses: string[];
+};
+
+export type IcmComputeAccelFromSamplesRequest = {
+  samples: IcmCapturedSample[];
+  min_accel_points: number;
+};
+
 type InvokeFn = (command: string, payload?: Record<string, unknown>) => Promise<unknown>;
 
 function toCommandString(args: string[]): string {
@@ -264,4 +308,24 @@ export async function captureIcmCalibrationConnected(
     throw new Error("Tauri backend bridge is not connected.");
   }
   return invoke("icm_capture_calibration_connected", { request });
+}
+
+export async function captureIcmSamplesConnected(
+  request: IcmCaptureSamplesConnectedRequest,
+): Promise<unknown> {
+  const invoke = await resolveInvoke();
+  if (!invoke) {
+    throw new Error("Tauri backend bridge is not connected.");
+  }
+  return invoke("icm_capture_samples_connected", { request });
+}
+
+export async function computeIcmAccelFromSamples(
+  request: IcmComputeAccelFromSamplesRequest,
+): Promise<unknown> {
+  const invoke = await resolveInvoke();
+  if (!invoke) {
+    throw new Error("Tauri backend bridge is not connected.");
+  }
+  return invoke("icm_compute_accel_from_samples", { request });
 }

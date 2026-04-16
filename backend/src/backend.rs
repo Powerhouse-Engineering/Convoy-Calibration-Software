@@ -8,14 +8,19 @@ use crate::process::{run_command, tail_lines};
 use crate::rtt_text::{RttServerConfig, RttSession};
 use crate::types::{
     BuildRequest, BuildResult, FlashRequest, FlashResult, IcmCaptureCalibrationRequest,
-    IcmCaptureCalibrationResult, IcmWriteCalibrationRequest, IcmWriteCalibrationResult, ImuModel,
-    RttCommandRequest, RttCommandResult, ToolStatus, ToolchainStatus,
+    IcmCaptureCalibrationResult, IcmCsvSample, IcmWriteCalibrationRequest,
+    IcmWriteCalibrationResult, ImuModel, RttCommandRequest, RttCommandResult, ToolStatus,
+    ToolchainStatus,
 };
 use crate::{BackendError, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const DEFAULT_PROFILE: &str = "imu_calibration_rtt";
+const CAPTURE_BACKLOG_DRAIN_MAX: Duration = Duration::from_millis(1200);
+const CAPTURE_BACKLOG_DRAIN_READ: Duration = Duration::from_millis(120);
+const CAPTURE_READ_TIMEOUT: Duration = Duration::from_millis(200);
+const CAPTURE_MAX_COMPUTE_SAMPLES: usize = 20_000;
 
 #[derive(Debug, Clone)]
 pub struct CalibrationBackend {
@@ -204,13 +209,15 @@ impl CalibrationBackend {
         let start_result = session.send_command_and_wait_ack("START", ack_timeout)?;
         responses.extend(start_result.lines);
 
+        drain_binary_backlog(&mut session)?;
+
         let capture_seconds = request.capture_seconds.max(1.0);
         let capture_deadline = Instant::now() + Duration::from_secs_f32(capture_seconds);
         let capture_start = Instant::now();
         let mut samples = Vec::new();
 
         while Instant::now() < capture_deadline {
-            let read_deadline = Instant::now() + Duration::from_millis(200);
+            let read_deadline = Instant::now() + CAPTURE_READ_TIMEOUT;
             if let Some(frame) = session.read_binary_frame_until(read_deadline)? {
                 if let Some(sample) =
                     parse_icm_binary_sample(&frame, capture_start.elapsed().as_secs_f32())
@@ -219,6 +226,8 @@ impl CalibrationBackend {
                 }
             }
         }
+
+        cap_calibration_samples(&mut samples, CAPTURE_MAX_COMPUTE_SAMPLES);
 
         if let Ok(stop_result) = session.send_command_and_wait_ack("STOP", ack_timeout) {
             responses.extend(stop_result.lines);
@@ -599,6 +608,33 @@ impl CalibrationBackend {
             },
         }
     }
+}
+
+fn drain_binary_backlog(session: &mut RttSession) -> Result<()> {
+    let drain_deadline = Instant::now() + CAPTURE_BACKLOG_DRAIN_MAX;
+    while Instant::now() < drain_deadline {
+        let read_deadline = Instant::now() + CAPTURE_BACKLOG_DRAIN_READ;
+        let frame = session.read_binary_frame_until(read_deadline)?;
+        if frame.is_none() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn cap_calibration_samples(samples: &mut Vec<IcmCsvSample>, max_samples: usize) {
+    if samples.len() <= max_samples || max_samples == 0 {
+        return;
+    }
+
+    let stride = ((samples.len() + max_samples - 1) / max_samples).max(1);
+    let downsampled = samples
+        .iter()
+        .step_by(stride)
+        .take(max_samples)
+        .cloned()
+        .collect::<Vec<_>>();
+    *samples = downsampled;
 }
 
 fn ensure_tool_available(executable: &str, version_args: &[&str]) -> Result<()> {

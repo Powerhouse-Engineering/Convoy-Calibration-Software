@@ -24,6 +24,12 @@ use tauri::Emitter;
 const GYRO_STREAM_SAMPLE_EVENT: &str = "gyro-stream-sample";
 const GYRO_STREAM_STATUS_EVENT: &str = "gyro-stream-status";
 const RTT_CONNECTION_STATUS_EVENT: &str = "rtt-connection-status";
+const CAPTURE_BACKLOG_DRAIN_MAX: Duration = Duration::from_millis(1200);
+const CAPTURE_BACKLOG_DRAIN_READ: Duration = Duration::from_millis(120);
+const CAPTURE_READ_TIMEOUT: Duration = Duration::from_millis(200);
+const CAPTURE_MAX_COMPUTE_SAMPLES: usize = 20_000;
+const CAPTURE_SAMPLE_TIMEOUT_PADDING_S: f32 = 3.0;
+const CAPTURE_SAMPLE_TIMEOUT_MULTIPLIER: f32 = 3.0;
 
 fn default_plot_decimation_u32() -> u32 {
     1
@@ -117,6 +123,47 @@ struct PersistentRttConnectRequest {
 struct RttConnectedCommandRequest {
     commands: Vec<String>,
     ack_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IcmCaptureSamplesConnectedRequest {
+    #[serde(default = "default_imu_model")]
+    imu_model: ImuModel,
+    ack_timeout_ms: u64,
+    odr_hz: u32,
+    stream_hz: u32,
+    accel_range_g: u32,
+    gyro_range_dps: u32,
+    low_noise: bool,
+    fifo: bool,
+    fifo_hires: bool,
+    #[serde(default = "default_true")]
+    bno_raw: bool,
+    #[serde(default = "default_true")]
+    bno_6dof: bool,
+    target_samples: usize,
+    #[serde(default)]
+    keep_stream_running: bool,
+    #[serde(default = "default_plot_decimation_u32")]
+    plot_decimation: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct IcmCaptureSamplesConnectedResult {
+    sample_count: usize,
+    samples: Vec<calibration_backend::IcmCsvSample>,
+    responses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IcmComputeAccelFromSamplesRequest {
+    samples: Vec<calibration_backend::IcmCsvSample>,
+    min_accel_points: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct IcmComputeAccelFromSamplesResult {
+    estimate: IcmCalibrationEstimate,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -734,6 +781,8 @@ fn icm_capture_calibration_connected_inner(
             responses.extend(start_result.lines);
         }
 
+        drain_binary_backlog(current)?;
+
         let capture_seconds = request.capture_seconds.max(1.0);
         let capture_deadline = Instant::now() + Duration::from_secs_f32(capture_seconds);
         let capture_start = Instant::now();
@@ -742,7 +791,7 @@ fn icm_capture_calibration_connected_inner(
         let plot_decimation = request.plot_decimation.max(1);
 
         while Instant::now() < capture_deadline {
-            let read_deadline = Instant::now() + Duration::from_millis(200);
+            let read_deadline = Instant::now() + CAPTURE_READ_TIMEOUT;
             let frame = {
                 let mut guard = current
                     .lock()
@@ -777,6 +826,8 @@ fn icm_capture_calibration_connected_inner(
                 }
             }
         }
+
+        cap_calibration_samples(&mut samples, CAPTURE_MAX_COMPUTE_SAMPLES);
 
         if request.keep_stream_running {
             // Resume the shared drainer before local compute so plotting can continue
@@ -862,6 +913,230 @@ fn icm_capture_calibration_connected_inner(
     }
 
     result
+}
+
+#[tauri::command]
+async fn icm_capture_samples_connected(
+    app: tauri::AppHandle,
+    rtt_state: tauri::State<'_, PersistentRttState>,
+    request: IcmCaptureSamplesConnectedRequest,
+) -> Result<IcmCaptureSamplesConnectedResult, String> {
+    let current = Arc::clone(&rtt_state.current);
+    let last_request = Arc::clone(&rtt_state.last_request);
+    let drainer = Arc::clone(&rtt_state.drainer);
+    let app_handle = app.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        icm_capture_samples_connected_inner(
+            &app_handle,
+            &current,
+            &last_request,
+            &drainer,
+            request,
+        )
+    })
+    .await
+    .map_err(|err| format!("connected sample capture task join error: {err}"))?
+}
+
+fn icm_capture_samples_connected_inner(
+    app: &tauri::AppHandle,
+    current: &Arc<Mutex<Option<PersistentRttConnection>>>,
+    last_request: &Arc<Mutex<Option<PersistentRttConnectRequest>>>,
+    drainer: &Arc<Mutex<Option<PersistentRttDrainer>>>,
+    request: IcmCaptureSamplesConnectedRequest,
+) -> Result<IcmCaptureSamplesConnectedResult, String> {
+    if request.target_samples == 0 {
+        return Err("target_samples must be > 0".to_string());
+    }
+
+    stop_rtt_drainer(drainer)?;
+    let mut drainer_started_early = false;
+    let result = (|| -> Result<IcmCaptureSamplesConnectedResult, String> {
+        let ack_timeout = Duration::from_millis(request.ack_timeout_ms.max(500));
+        let mut responses = Vec::<String>::new();
+
+        if !request.keep_stream_running {
+            let commands = build_imu_setup_commands(
+                request.imu_model,
+                request.odr_hz,
+                request.stream_hz,
+                request.accel_range_g,
+                request.gyro_range_dps,
+                request.low_noise,
+                request.fifo,
+                request.fifo_hires,
+                if request.imu_model == ImuModel::Bno086 {
+                    true
+                } else {
+                    request.bno_raw
+                },
+                request.bno_6dof,
+            );
+
+            for command in commands {
+                let command_result = {
+                    let mut guard = current
+                        .lock()
+                        .map_err(|_| "persistent RTT state lock poisoned".to_string())?;
+                    let connection = guard
+                        .as_mut()
+                        .ok_or_else(|| "RTT is not connected. Use Connect first.".to_string())?;
+                    connection
+                        .session
+                        .send_command_and_wait_ack(&command, ack_timeout)
+                        .map_err(|err| err.to_string())?
+                };
+                responses.extend(command_result.lines);
+            }
+
+            let start_result = {
+                let mut guard = current
+                    .lock()
+                    .map_err(|_| "persistent RTT state lock poisoned".to_string())?;
+                let connection = guard
+                    .as_mut()
+                    .ok_or_else(|| "RTT is not connected. Use Connect first.".to_string())?;
+                connection
+                    .session
+                    .send_command_and_wait_ack("START", ack_timeout)
+                    .map_err(|err| err.to_string())?
+            };
+            responses.extend(start_result.lines);
+        }
+
+        drain_binary_backlog(current)?;
+
+        let target_samples = request.target_samples.max(1);
+        let mut samples = Vec::<calibration_backend::IcmCsvSample>::with_capacity(target_samples);
+        let mut sample_emit_counter = 0u32;
+        let plot_decimation = request.plot_decimation.max(1);
+        let capture_start = Instant::now();
+        let expected_seconds = target_samples as f32 / request.stream_hz.max(1) as f32;
+        let timeout_seconds =
+            (expected_seconds * CAPTURE_SAMPLE_TIMEOUT_MULTIPLIER).max(3.0)
+                + CAPTURE_SAMPLE_TIMEOUT_PADDING_S;
+        let capture_deadline = Instant::now() + Duration::from_secs_f32(timeout_seconds);
+
+        while samples.len() < target_samples && Instant::now() < capture_deadline {
+            let read_deadline = Instant::now() + CAPTURE_READ_TIMEOUT;
+            let frame = {
+                let mut guard = current
+                    .lock()
+                    .map_err(|_| "persistent RTT state lock poisoned".to_string())?;
+                let connection = guard
+                    .as_mut()
+                    .ok_or_else(|| "RTT disconnected during sample capture".to_string())?;
+                connection
+                    .session
+                    .read_binary_frame_until(read_deadline)
+                    .map_err(|err| err.to_string())?
+            };
+
+            if let Some(frame) = frame {
+                if let Some(sample) =
+                    parse_icm_binary_sample(&frame, capture_start.elapsed().as_secs_f32())
+                {
+                    if should_emit_sample(plot_decimation, &mut sample_emit_counter) {
+                        let payload = GyroRealtimeSampleEvent {
+                            seq: sample.seq,
+                            timestamp_ms: sample.timestamp_ms,
+                            ax: sample.accel_mps2[0],
+                            ay: sample.accel_mps2[1],
+                            az: sample.accel_mps2[2],
+                            gx: sample.gyro_dps[0],
+                            gy: sample.gyro_dps[1],
+                            gz: sample.gyro_dps[2],
+                        };
+                        let _ = app.emit(GYRO_STREAM_SAMPLE_EVENT, payload);
+                    }
+                    samples.push(sample);
+                }
+            }
+        }
+
+        if request.keep_stream_running {
+            start_rtt_drainer(current, last_request, drainer, app.clone())?;
+            drainer_started_early = true;
+        } else {
+            let stop_result = {
+                let mut guard = current
+                    .lock()
+                    .map_err(|_| "persistent RTT state lock poisoned".to_string())?;
+                if let Some(connection) = guard.as_mut() {
+                    connection
+                        .session
+                        .send_command_and_wait_ack("STOP", ack_timeout)
+                        .ok()
+                } else {
+                    None
+                }
+            };
+            if let Some(stop_result) = stop_result {
+                responses.extend(stop_result.lines);
+            }
+        }
+
+        if samples.len() < target_samples {
+            return Err(format!(
+                "sample capture timeout (collected {} / {} samples)",
+                samples.len(),
+                target_samples
+            ));
+        }
+
+        Ok(IcmCaptureSamplesConnectedResult {
+            sample_count: samples.len(),
+            samples,
+            responses,
+        })
+    })();
+
+    let should_restart = {
+        let has_connection = current.lock().map(|guard| guard.is_some()).unwrap_or(false);
+        let has_request = last_request
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false);
+        has_connection && has_request
+    };
+
+    if should_restart && !drainer_started_early {
+        if let Err(err) = start_rtt_drainer(current, last_request, drainer, app.clone()) {
+            if result.is_ok() {
+                return Err(err);
+            }
+        }
+    }
+
+    result
+}
+
+#[tauri::command]
+async fn icm_compute_accel_from_samples(
+    request: IcmComputeAccelFromSamplesRequest,
+) -> Result<IcmComputeAccelFromSamplesResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let min_points = request.min_accel_points.max(1);
+        ensure_min_total_samples(&request.samples, min_points).map_err(|err| err.to_string())?;
+        let (accel_offset, accel_xform, residual_rms, residual_max, _point_count) =
+            estimate_accel_ellipsoid_with_min_points(&request.samples, min_points)
+                .map_err(|err| err.to_string())?;
+
+        Ok(IcmComputeAccelFromSamplesResult {
+            estimate: IcmCalibrationEstimate {
+                sample_count: request.samples.len(),
+                gyro_sample_count: 0,
+                gyro_bias_dps: [0.0, 0.0, 0.0],
+                accel_offset_mps2: accel_offset,
+                accel_xform,
+                residual_rms_mps2: residual_rms,
+                residual_max_mps2: residual_max,
+            },
+        })
+    })
+    .await
+    .map_err(|err| format!("compute accel from samples task join error: {err}"))?
 }
 
 fn start_rtt_drainer(
@@ -1050,6 +1325,51 @@ fn open_persistent_rtt_connection(
         ack_timeout: Duration::from_millis(request.ack_timeout_ms.max(500)),
         plot_decimation: request.plot_decimation.max(1),
     })
+}
+
+fn drain_binary_backlog(
+    current: &Arc<Mutex<Option<PersistentRttConnection>>>,
+) -> Result<(), String> {
+    let drain_deadline = Instant::now() + CAPTURE_BACKLOG_DRAIN_MAX;
+    while Instant::now() < drain_deadline {
+        let read_deadline = Instant::now() + CAPTURE_BACKLOG_DRAIN_READ;
+        let frame = {
+            let mut guard = current
+                .lock()
+                .map_err(|_| "persistent RTT state lock poisoned".to_string())?;
+            let connection = guard
+                .as_mut()
+                .ok_or_else(|| "RTT disconnected during capture".to_string())?;
+            connection
+                .session
+                .read_binary_frame_until(read_deadline)
+                .map_err(|err| err.to_string())?
+        };
+
+        if frame.is_none() {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn cap_calibration_samples(
+    samples: &mut Vec<calibration_backend::IcmCsvSample>,
+    max_samples: usize,
+) {
+    if samples.len() <= max_samples || max_samples == 0 {
+        return;
+    }
+
+    let stride = ((samples.len() + max_samples - 1) / max_samples).max(1);
+    let downsampled = samples
+        .iter()
+        .step_by(stride)
+        .take(max_samples)
+        .cloned()
+        .collect::<Vec<_>>();
+    *samples = downsampled;
 }
 
 fn stop_rtt_drainer(drainer: &Arc<Mutex<Option<PersistentRttDrainer>>>) -> Result<(), String> {
@@ -1586,6 +1906,8 @@ fn main() {
             set_rtt_plot_decimation,
             rtt_command_connected,
             icm_capture_calibration_connected,
+            icm_capture_samples_connected,
+            icm_compute_accel_from_samples,
             start_gyro_stream,
             stop_gyro_stream
         ])
