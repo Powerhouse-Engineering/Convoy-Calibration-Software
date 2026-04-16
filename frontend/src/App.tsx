@@ -2336,7 +2336,8 @@ export default function App() {
   }
 
   async function onBnoCalStart() {
-    const output = await runConnectedRttCommands(["IMU BNO086", "APPLY", "CAL_START", "START"]);
+    pushLog("info", "Starting BNO internal calibration (forcing BNO_RAW=1 for live accel/gyro accuracy updates)");
+    const output = await runConnectedRttCommands(["IMU BNO086", "BNO_RAW 1", "APPLY", "CAL_START", "CAL_STATUS", "START"]);
     if (output !== null) {
       setRuntimeStreamRunning(true);
     }
